@@ -1,0 +1,1732 @@
+//! Hobbs-style paranoid search over the existing FutureGraph.
+//!
+//! The route value comes from the reached state, not the sum of Food,
+//! Hunting and Survival transition scores. Every enumerated enemy response
+//! participates in MIN; opponent intent only affects expansion order.
+//! Iterative deepening commits the previous complete depth on timeout.
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use crate::analysis::{
+    adversarial_order, AdversarialCorridorOrder, AdversarialEscapeAnalyzer, CorridorOutlook,
+    EscapeEvidence, TemporalTerritory, TerritoryDirectionSample, TerritorySnapshot,
+    TerritoryTrajectory,
+};
+use crate::direction::Direction;
+use crate::evaluation::{
+    assess_survival_state, evaluate_hobbs_state, HobbsScoreParams, StateScore, TrapAssessment,
+};
+#[cfg(test)]
+use crate::simulation::joint_action::JointAction;
+use crate::simulation::mobility::MobilityAnalysis;
+
+use super::budget::SearchBudget;
+use super::forecast::ForecastCertainty;
+use super::graph::{
+    CachedSearchValue, FutureGraph, NodeId, ResponseLookup, SearchEdge, SearchError,
+};
+use super::path::{FuturePath, FutureStep, MAX_SEARCH_DEPTH};
+use super::primary_ordering::sort_primary_root;
+use super::root_ordering::{reorder_root_v2, RootV2Hint};
+
+#[derive(Debug, Clone)]
+pub(crate) struct HobbsSearchResult {
+    pub(crate) direction: Direction,
+    pub(crate) score: StateScore,
+    pub(crate) survival: TrapAssessment,
+    pub(crate) completed_depth: u8,
+    pub(crate) root_directions: usize,
+    pub(crate) certainty: ForecastCertainty,
+    /// Actual MAX/MIN-selected line; no additional search is required for
+    /// shadow territorial diagnostics, even when iterative deepening stops.
+    pub(crate) path: FuturePath,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RouteRank {
+    score: StateScore,
+    safety: TrapAssessment,
+    // Tactical pressure is only a secondary, non-terminal ordering criterion.
+    // It can never turn an optimistic corridor forecast into a proven win.
+    pressure: u8,
+}
+
+impl RouteRank {
+    fn tier(self) -> u8 {
+        match (self.score, self.safety) {
+            (StateScore::Win, _) => 6,
+            (StateScore::Loss, _) | (_, TrapAssessment::ProvenTrap) => 0,
+            (StateScore::Tie, _) => 1,
+            (_, TrapAssessment::Viable) => 5,
+            (_, TrapAssessment::Unknown) => 4,
+            (_, TrapAssessment::Constrained) => 3,
+            (_, TrapAssessment::ForcedCorridor) => 2,
+        }
+    }
+
+    fn safety_rank(self) -> u8 {
+        match self.safety {
+            TrapAssessment::Viable => 4,
+            TrapAssessment::Unknown => 3,
+            TrapAssessment::Constrained => 2,
+            TrapAssessment::ForcedCorridor => 1,
+            TrapAssessment::ProvenTrap => 0,
+        }
+    }
+}
+
+impl Ord for RouteRank {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.tier()
+            .cmp(&other.tier())
+            .then_with(|| match (self.score, other.score) {
+                (
+                    StateScore::Normal {
+                        utility_milli: left,
+                    },
+                    StateScore::Normal {
+                        utility_milli: right,
+                    },
+                ) => left
+                    .saturating_add(i64::from(self.pressure) * 20)
+                    .cmp(&right.saturating_add(i64::from(other.pressure) * 20)),
+                _ => self.score.cmp(&other.score),
+            })
+            .then_with(|| self.pressure.cmp(&other.pressure))
+            .then_with(|| self.safety_rank().cmp(&other.safety_rank()))
+    }
+}
+
+impl PartialOrd for RouteRank {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Route {
+    rank: RouteRank,
+    path: FuturePath,
+    certainty: ForecastCertainty,
+    /// Exact number of simulated turns until a terminal Win/Loss/Tie.
+    /// Only present when the terminal state was actually reached.
+    terminal_plies: Option<u16>,
+    /// True only if all legal MAX moves and MIN replies beneath this node
+    /// were explored without a tactical alpha cut, through this horizon.
+    exhaustive: bool,
+}
+
+fn compare_routes(left: &Route, right: &Route) -> Ordering {
+    match (left.rank.score, right.rank.score) {
+        // If every available reply loses, delay a proven loss.
+        (StateScore::Loss, StateScore::Loss)
+            if left.terminal_plies.is_some() && right.terminal_plies.is_some() =>
+        {
+            // Avoid an immediate collision before comparing other losing lines.
+            // Otherwise keep the structural guard's escape preference: a path
+            // with more freedom must not lose merely because a forecast delays
+            // its eventual terminal outcome by one speculative turn.
+            let left_immediate = left.terminal_plies == Some(1);
+            let right_immediate = right.terminal_plies == Some(1);
+            right_immediate
+                .cmp(&left_immediate)
+                .then_with(|| left.rank.cmp(&right.rank))
+                .then_with(|| left.terminal_plies.cmp(&right.terminal_plies))
+        }
+        // Among forced wins, complete the win earlier.
+        (StateScore::Win, StateScore::Win)
+            if left.terminal_plies.is_some() && right.terminal_plies.is_some() =>
+        {
+            right
+                .terminal_plies
+                .cmp(&left.terminal_plies)
+                .then_with(|| left.rank.cmp(&right.rank))
+        }
+        _ => left.rank.cmp(&right.rank),
+    }
+}
+
+/// Search-scoped caches stay valid across iterative-deepening iterations.
+#[derive(Default)]
+struct ScoredCache {
+    leaf_ranks: HashMap<NodeId, ScoredLeaf>,
+    corridor_orders: HashMap<NodeId, AdversarialCorridorOrder>,
+    territory_snapshots: HashMap<NodeId, TerritorySnapshot>,
+    escape_snapshots: HashMap<NodeId, crate::analysis::EscapeSnapshot>,
+    /// Root directions from ONE completed iterative-deepening depth only.
+    /// Replaced atomically after a successful depth (never on deadline).
+    completed_root_lines: HashMap<Direction, CompletedRootLine>,
+    v2_spent: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScoredLeaf {
+    rank: RouteRank,
+    territory: Option<TerritorySnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletedRootLine {
+    depth: u8,
+    path: FuturePath,
+    certainty: ForecastCertainty,
+    adversarially_complete: bool,
+}
+
+impl ScoredCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn leaf(&mut self, graph: &FutureGraph, id: NodeId) -> RouteRank {
+        if let Some(leaf) = self.leaf_ranks.get(&id) {
+            return leaf.rank;
+        }
+        let leaf = evaluate_leaf(graph, id);
+        self.leaf_ranks.insert(id, leaf);
+        leaf.rank
+    }
+
+    fn get(&self, id: &NodeId) -> Option<&RouteRank> {
+        self.leaf_ranks.get(id).map(|leaf| &leaf.rank)
+    }
+
+    fn corridor(&mut self, graph: &FutureGraph, node: NodeId) -> AdversarialCorridorOrder {
+        *self
+            .corridor_orders
+            .entry(node)
+            .or_insert_with(|| adversarial_order(&graph.node(node).state))
+    }
+}
+
+/// Ordering copied exactly from the last 2/3-winning revision (3fcb6a1).
+/// Keep the original comparison available as a true fallback: cached
+/// territorial evidence must never change this path when disabled.
+fn baseline_root_key(
+    direction: Direction,
+    preferred: Option<Direction>,
+    hints: &HashMap<Direction, (u8, u8)>,
+) -> (bool, bool, std::cmp::Reverse<u8>, u8, u8) {
+    let (our_exits, their_exits) = hints.get(&direction).copied().unwrap_or((0, u8::MAX));
+    (
+        our_exits == 0,
+        Some(direction) != preferred,
+        std::cmp::Reverse(our_exits),
+        their_exits,
+        direction.rank(),
+    )
+}
+
+fn baseline_root_order(
+    directions: &mut [Direction],
+    preferred: Option<Direction>,
+    hints: &HashMap<Direction, (u8, u8)>,
+) {
+    directions.sort_by_key(|&direction| baseline_root_key(direction, preferred, hints));
+}
+
+/// Conservative V2 only consumes prior, fully finished iterative-deepening
+/// results. No graph expansion; no adjustments to scores or MIN responses.
+/// The total analysis allowance across depths is 3 ms per decision.
+fn conservative_v2_root_order(
+    graph: &FutureGraph,
+    directions: &mut [Direction],
+    depth: u8,
+    cache: &mut ScoredCache,
+    budget: &SearchBudget,
+) {
+    const TOTAL_OVERHEAD: Duration = Duration::from_millis(3);
+    let available = TOTAL_OVERHEAD.saturating_sub(cache.v2_spent);
+    if depth < 2 || directions.len() < 2 || available.is_zero() || budget.expired() {
+        return;
+    }
+    let previous_depth = depth - 1;
+    if !directions.iter().all(|direction| {
+        cache
+            .completed_root_lines
+            .get(direction)
+            .is_some_and(|line| line.depth == previous_depth)
+    }) {
+        log::debug!(
+            target: "territorial_control",
+            "root_ordering_v2 turn={} depth={} fallback=incomplete_previous_depth",
+            graph.node(graph.root()).state.turn,
+            depth,
+        );
+        return;
+    }
+    let horizon = previous_depth.min(4);
+    let start = Instant::now();
+    let deadline = start + available;
+    let mut analyzer = AdversarialEscapeAnalyzer::new(graph, deadline);
+    let mut hints = HashMap::<Direction, RootV2Hint>::new();
+    let baseline = directions.to_vec();
+    for &direction in baseline.iter() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let risk = analyzer.analyze_root_direction(direction, horizon);
+        if risk.budget_truncated {
+            break;
+        }
+        hints.insert(
+            direction,
+            RootV2Hint {
+                verdict: risk.verdict,
+                certainty: risk.certainty,
+                horizon: risk.requested_horizon,
+                comparable_margin: None,
+            },
+        );
+    }
+
+    // Territory is a selected-path heuristic, never a worst-case MIN bound.
+    // Only compare it when every direction is fully certified safe in the
+    // same fixed-food horizon and every line has exhaustive MIN coverage.
+    let territorial_eligible = hints.len() == directions.len()
+        && directions.iter().all(|direction| {
+            let hint = hints[direction];
+            let line = &cache.completed_root_lines[direction];
+            hint.verdict == crate::analysis::AdversarialEscapeVerdict::SurvivesHorizon
+                && hint.certainty == Some(ForecastCertainty::Deterministic)
+                && line.adversarially_complete
+                && !line.certainty.is_provisional()
+        });
+    if territorial_eligible {
+        let mut margins = HashMap::<Direction, (i64, u8)>::new();
+        for &direction in baseline.iter() {
+            if let Some(trajectory) = TerritoryTrajectory::from_graph_path(
+                graph,
+                &cache.completed_root_lines[&direction].path,
+                ForecastCertainty::Deterministic,
+                deadline,
+                &mut cache.territory_snapshots,
+            ) {
+                margins.insert(
+                    direction,
+                    (trajectory.mean_margin_milli, trajectory.samples),
+                );
+            } else {
+                break;
+            }
+        }
+        if margins.len() == directions.len()
+            && margins
+                .values()
+                .all(|(_, count)| *count == margins[&baseline[0]].1)
+        {
+            for (direction, (margin, _)) in margins {
+                if let Some(hint) = hints.get_mut(&direction) {
+                    hint.comparable_margin = Some(margin);
+                }
+            }
+        }
+    }
+    let changed = Instant::now() < deadline && reorder_root_v2(directions, &hints, horizon);
+    cache.v2_spent = cache.v2_spent.saturating_add(start.elapsed());
+    log::debug!(
+        target: "territorial_control",
+        "root_ordering_v2 turn={} depth={} source_depth={} horizon={} changed={} before={:?} after={:?} hints={:?} overhead_us={} evidence=certified_fixed_food_or_baseline",
+        graph.node(graph.root()).state.turn,
+        depth,
+        previous_depth,
+        horizon,
+        changed,
+        baseline,
+        directions,
+        hints,
+        cache.v2_spent.as_micros(),
+    );
+}
+
+fn alpha_cuts_reply(incumbent: &Route, worst_so_far: &Route) -> bool {
+    // MIN cannot improve its value by inspecting additional replies. Once its
+    // upper bound is <= this MAX incumbent, the action cannot win the MAX.
+    !compare_routes(worst_so_far, incumbent).is_gt()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootSearchOrdering {
+    Baseline,
+    Primary,
+    PrimaryV3,
+    ConservativeV2,
+}
+
+/// Primary Hobbs search: the territory-first root ordering that won 3/3
+/// pinned-seed local duels in benchmark 38016396600. Keep this behavior
+/// stable as the baseline for future experiments.
+pub(crate) fn search_hobbs(
+    graph: &mut FutureGraph,
+    budget: &SearchBudget,
+) -> Result<Option<HobbsSearchResult>, SearchError> {
+    search_hobbs_with_ordering(graph, budget, RootSearchOrdering::Primary)
+}
+
+/// Historical unmodified root order. Explicit `off` and `shadow` use this
+/// for controlled comparisons; it is no longer the implicit primary mode.
+pub(crate) fn search_hobbs_baseline(
+    graph: &mut FutureGraph,
+    budget: &SearchBudget,
+) -> Result<Option<HobbsSearchResult>, SearchError> {
+    search_hobbs_with_ordering(graph, budget, RootSearchOrdering::Baseline)
+}
+
+/// Experimental V3: primary ordering with sampled territorial-collapse tiebreaks.
+pub(crate) fn search_hobbs_ordering_v3(
+    graph: &mut FutureGraph,
+    budget: &SearchBudget,
+) -> Result<Option<HobbsSearchResult>, SearchError> {
+    search_hobbs_with_ordering(graph, budget, RootSearchOrdering::PrimaryV3)
+}
+
+/// Only opt-in ordering_v2 changes root exploration order. All MIN responses
+/// and the original RouteRank / compare_routes semantics are retained.
+pub(crate) fn search_hobbs_ordering_v2(
+    graph: &mut FutureGraph,
+    budget: &SearchBudget,
+) -> Result<Option<HobbsSearchResult>, SearchError> {
+    search_hobbs_with_ordering(graph, budget, RootSearchOrdering::ConservativeV2)
+}
+
+fn search_hobbs_with_ordering(
+    graph: &mut FutureGraph,
+    budget: &SearchBudget,
+    ordering_mode: RootSearchOrdering,
+) -> Result<Option<HobbsSearchResult>, SearchError> {
+    // The soft deadline leaves headroom for serialization and runtime jitter.
+    let search_budget = budget.limited_to_soft_deadline();
+    let mut scored = ScoredCache::new();
+    let root = graph.root();
+    let mut last_complete = None;
+    for depth in 1..=MAX_SEARCH_DEPTH {
+        if search_budget.expired() {
+            break;
+        }
+        let Some(route) = evaluate_minimax(
+            graph,
+            root,
+            depth,
+            ForecastCertainty::Deterministic,
+            &search_budget,
+            &mut scored,
+            ordering_mode,
+        )?
+        else {
+            break;
+        };
+
+        let Some(our_actor) = graph
+            .node(root)
+            .state
+            .actor_index(&graph.node(root).state.our_snake_id)
+        else {
+            return Ok(last_complete);
+        };
+        let Some(direction) = route
+            .path
+            .first()
+            .and_then(|step| step.joint_action.direction_for(our_actor))
+        else {
+            return Ok(last_complete);
+        };
+
+        let directions = graph
+            .node(root)
+            .children
+            .iter()
+            .filter_map(|edge| edge.joint_action.direction_for(our_actor))
+            .collect::<std::collections::HashSet<_>>();
+        let survival = route.rank.safety;
+        log::debug!(
+            target: "search_diagnostics",
+            "hobbs_depth turn={} depth={} move={:?} score={:?} survival={:?} root_directions={} nodes={}",
+            graph.node(root).state.turn,
+            depth,
+            direction,
+            route.rank.score,
+            survival,
+            directions.len(),
+            graph.node_count(),
+        );
+        last_complete = Some(HobbsSearchResult {
+            direction,
+            score: route.rank.score,
+            survival,
+            completed_depth: depth,
+            root_directions: directions.len(),
+            certainty: route.certainty,
+            path: route.path.clone(),
+        });
+        // If the winner/loser is known at an immediate horizon and verified
+        // deterministic, continuing cannot change that branch's outcome.
+        if depth > 1
+            && matches!(route.rank.score, StateScore::Win)
+            && !route.certainty.is_provisional()
+        {
+            break;
+        }
+    }
+    // Completed root lines are comparable only at an identical horizon.
+    // Keep these diagnostics out of MAX/MIN route comparison until ordering
+    // V2 has validated coverage and food certainty against the baseline.
+    if ordering_mode == RootSearchOrdering::ConservativeV2 {
+        let deadline = Instant::now() + Duration::from_millis(2);
+        // Stable iteration makes limited-budget diagnostics reproducible.
+        let mut adversarial = AdversarialEscapeAnalyzer::new(graph, deadline);
+        for direction in Direction::ALL {
+            let Some(line) = scored.completed_root_lines.get(&direction) else {
+                continue;
+            };
+            if Instant::now() >= deadline {
+                break;
+            }
+            // Prioritize cheap, cached escape evidence over territorial
+            // flood-fill. Neither diagnostic changes MAX/MIN route scores.
+            if let Some(escape) = EscapeEvidence::from_graph_path(
+                graph,
+                &line.path,
+                line.certainty,
+                line.adversarially_complete,
+                deadline,
+                &mut scored.escape_snapshots,
+            ) {
+                log::debug!(
+                    target: "territorial_control",
+                    "escape_completed_line turn={} direction={:?} depth={} states={} requested_horizon={} observed_horizon={} available_plies={} horizon_complete={} minimum_exits={} minimum_uncontested={} narrow_at={:?} contested_at={:?} all_contested_at={:?} closed_at={:?} death_at={:?} quality={:?} evidence=observed_minimax_path_only",
+                    graph.node(root).state.turn,
+                    direction,
+                    line.depth,
+                    escape.observed_states,
+                    escape.requested_horizon,
+                    escape.observed_horizon,
+                    escape.available_plies,
+                    escape.reached_requested_horizon,
+                    escape.minimum_exits,
+                    escape.minimum_uncontested_exits,
+                    escape.first_narrow_ply,
+                    escape.first_contested_ply,
+                    escape.first_all_exits_contested_ply,
+                    escape.first_no_exit_ply,
+                    escape.first_observed_death_ply,
+                    escape.quality,
+                );
+                let risk = adversarial.analyze_root_direction(direction, escape.requested_horizon);
+                log::debug!(
+                    target: "territorial_control",
+                    "escape_adversarial_line turn={} direction={:?} horizon={} verdict={:?} certainty={:?} reply_coverage={:?} known_replies={} terminal_loss_replies={} inspected_states={} inspected_replies={} budget_truncated={} evidence=cached_minimax_replies_only",
+                    graph.node(root).state.turn,
+                    direction,
+                    risk.requested_horizon,
+                    risk.verdict,
+                    risk.certainty,
+                    risk.root_coverage,
+                    risk.known_root_replies,
+                    risk.observed_losing_root_replies,
+                    risk.checked_states,
+                    risk.checked_replies,
+                    risk.budget_truncated,
+                );
+            }
+            if let Some(trajectory) = TerritoryTrajectory::from_graph_path(
+                graph,
+                &line.path,
+                line.certainty,
+                deadline,
+                &mut scored.territory_snapshots,
+            ) {
+                log::debug!(
+                    target: "territorial_control",
+                    "territory_completed_line turn={} direction={:?} depth={} samples={} complete={} provisional={} mean={} minimum={} evidence=one_completed_minimax_depth",
+                    graph.node(root).state.turn,
+                    direction,
+                    line.depth,
+                    trajectory.samples,
+                    line.adversarially_complete,
+                    trajectory.certainty.is_provisional(),
+                    trajectory.mean_margin_milli,
+                    trajectory.minimum_margin_milli,
+                );
+            }
+        }
+    }
+    Ok(last_complete)
+}
+
+fn evaluate_minimax(
+    graph: &mut FutureGraph,
+    node_id: NodeId,
+    depth: u8,
+    certainty: ForecastCertainty,
+    budget: &SearchBudget,
+    cache: &mut ScoredCache,
+    ordering_mode: RootSearchOrdering,
+) -> Result<Option<Route>, SearchError> {
+    if budget.expired() {
+        return Ok(None);
+    }
+    if graph.node(node_id).is_terminal() || depth == 0 {
+        let rank = cache.leaf(graph, node_id);
+        return Ok(Some(Route {
+            rank,
+            path: FuturePath::empty(),
+            certainty,
+            terminal_plies: matches!(
+                rank.score,
+                StateScore::Win | StateScore::Loss | StateScore::Tie
+            )
+            .then_some(0),
+            exhaustive: true,
+        }));
+    }
+
+    let mut directions = graph.available_directions(node_id);
+    let preferred = graph.node(node_id).preferred_direction;
+    if node_id == graph.root() {
+        // Tactical move ordering only. A one-ply corridor estimate cannot
+        // prove a forced trap: all legal joint-action replies remain in MIN.
+        let mut corridor_by_direction = HashMap::<Direction, (u8, u8)>::new();
+        for direction in &directions {
+            let known = graph.known_responses(node_id, *direction);
+            if known.is_empty() {
+                continue;
+            }
+            let mut worst_ours = u8::MAX;
+            let mut best_enemy = 0_u8;
+            for edge in known {
+                let forecast = cache.corridor(graph, edge.child);
+                worst_ours = worst_ours.min(forecast.our_continuations());
+                best_enemy = best_enemy.max(forecast.enemy_continuations());
+            }
+            corridor_by_direction.insert(*direction, (worst_ours, best_enemy));
+        }
+        // Stable 3fcb6a1 tactical priority is the fallback when the primary
+        // ordering lacks samples for one or more root directions.
+        baseline_root_order(&mut directions, preferred, &corridor_by_direction);
+        // Primary: sample at most 24 unique cached states per search,
+        // considering up to two MIN replies and four cached positions.
+        // Each eligible search depth has a 2ms sampling deadline.
+        // No new graph actions are generated by these territory samples.
+        let mut territorial = HashMap::<Direction, TerritoryDirectionSample>::new();
+        if matches!(
+            ordering_mode,
+            RootSearchOrdering::Primary | RootSearchOrdering::PrimaryV3
+        ) && depth >= 2
+            && !budget.expired()
+        {
+            let expires = Instant::now() + Duration::from_millis(2);
+            for direction in &directions {
+                if Instant::now() >= expires {
+                    break;
+                }
+                if let Some(sample) = TerritoryDirectionSample::from_cached_replies(
+                    graph,
+                    *direction,
+                    &mut cache.territory_snapshots,
+                    |id| cache.leaf_ranks.get(&id).and_then(|leaf| leaf.territory),
+                    ordering_mode == RootSearchOrdering::PrimaryV3,
+                    expires,
+                ) {
+                    territorial.insert(*direction, sample);
+                }
+            }
+        }
+        // V3 compares against the exact primary order without another
+        // search, flood-fill, or MIN expansion (at most four root moves).
+        let primary_reference = (ordering_mode == RootSearchOrdering::PrimaryV3).then(|| {
+            let mut reference = directions.clone();
+            sort_primary_root(
+                &mut reference,
+                preferred,
+                &corridor_by_direction,
+                &territorial,
+                false,
+            );
+            reference
+        });
+        sort_primary_root(
+            &mut directions,
+            preferred,
+            &corridor_by_direction,
+            &territorial,
+            ordering_mode == RootSearchOrdering::PrimaryV3,
+        );
+        if let Some(reference) = primary_reference {
+            let significant_drops = territorial
+                .values()
+                .filter(|sample| {
+                    sample
+                        .territorial_drop
+                        .is_some_and(|drop| drop.significant())
+                })
+                .count();
+            log::debug!(
+                target: "territorial_control",
+                "root_ordering_v3 turn={} depth={} changed={} sampled={} sharp_drops={} primary={:?} actual={:?}",
+                graph.node(node_id).state.turn,
+                depth,
+                directions != reference,
+                territorial.len(),
+                significant_drops,
+                reference,
+                directions,
+            );
+        }
+        if ordering_mode == RootSearchOrdering::ConservativeV2 {
+            conservative_v2_root_order(graph, &mut directions, depth, cache, budget);
+        }
+    } else {
+        directions.sort_by_key(|direction| (Some(*direction) != preferred, direction.rank()));
+    }
+    if directions.is_empty() {
+        let rank = cache.leaf(graph, node_id);
+        return Ok(Some(Route {
+            rank,
+            path: FuturePath::empty(),
+            certainty,
+            terminal_plies: matches!(
+                rank.score,
+                StateScore::Win | StateScore::Loss | StateScore::Tie
+            )
+            .then_some(0),
+            exhaustive: true,
+        }));
+    }
+
+    let is_root = node_id == graph.root();
+    let mut root_lines = HashMap::<Direction, CompletedRootLine>::new();
+    let mut all_directions_exhaustive = true;
+    let mut best: Option<Route> = None;
+    for direction in directions {
+        let mut direction_exhaustive = true;
+        let mut known = graph.known_responses(node_id, direction);
+        let known_count = known.len();
+        let preferred_response = graph.node(node_id).preferred_reply.get(&direction).cloned();
+        let corridor_hints = if node_id == graph.root() {
+            known
+                .iter()
+                .map(|edge| (edge.child, cache.corridor(graph, edge.child)))
+                .collect::<HashMap<NodeId, AdversarialCorridorOrder>>()
+        } else {
+            HashMap::new()
+        };
+        known.sort_by(|a, b| {
+            (preferred_response.as_ref() == Some(&b.joint_action))
+                .cmp(&(preferred_response.as_ref() == Some(&a.joint_action)))
+                .then_with(
+                    || match (corridor_hints.get(&a.child), corridor_hints.get(&b.child)) {
+                        (Some(a), Some(b)) => a.cmp(b),
+                        _ => Ordering::Equal,
+                    },
+                )
+                .then_with(|| match (cache.get(&a.child), cache.get(&b.child)) {
+                    (Some(ra), Some(rb)) => ra.cmp(rb),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                })
+        });
+
+        let mut cached = known.into_iter();
+        let mut next_index = known_count;
+        let mut worst: Option<Route> = None;
+        let mut pruned = false;
+        loop {
+            let edge = if let Some(existing) = cached.next() {
+                existing
+            } else {
+                match graph.next_response(node_id, direction, next_index, budget)? {
+                    ResponseLookup::Edge(new_edge) => {
+                        next_index += 1;
+                        new_edge
+                    }
+                    ResponseLookup::Exhausted => break,
+                    ResponseLookup::Deadline => return Ok(None),
+                }
+            };
+            if budget.expired() {
+                return Ok(None);
+            }
+            let SearchEdge {
+                joint_action,
+                child,
+                forecast_delta,
+            } = edge;
+            let child_certainty = certainty.after(forecast_delta);
+            let Some(mut candidate) = evaluate_minimax(
+                graph,
+                child,
+                depth - 1,
+                child_certainty,
+                budget,
+                cache,
+                ordering_mode,
+            )?
+            else {
+                return Ok(None);
+            };
+            direction_exhaustive &= candidate.exhaustive;
+            candidate.terminal_plies = candidate
+                .terminal_plies
+                .map(|steps| steps.saturating_add(1));
+            let immediate_safety = assess_survival_state(&graph.node(child).state);
+            candidate.rank.safety = worst_safety(candidate.rank.safety, immediate_safety);
+            candidate.path = candidate.path.prepend(FutureStep {
+                node: node_id,
+                joint_action,
+                child,
+            });
+            if worst
+                .as_ref()
+                .is_none_or(|previous| compare_routes(&candidate, previous).is_lt())
+            {
+                worst = Some(candidate);
+            }
+            if let (Some(incumbent), Some(worst_so_far)) = (&best, &worst) {
+                if alpha_cuts_reply(incumbent, worst_so_far) {
+                    pruned = true;
+                    direction_exhaustive = false;
+                    break;
+                }
+            }
+        }
+        direction_exhaustive &=
+            graph.response_coverage(node_id, direction) == super::graph::ResponseCoverage::Complete;
+        all_directions_exhaustive &= direction_exhaustive;
+        if let Some(worst_response) = worst {
+            if is_root && ordering_mode == RootSearchOrdering::ConservativeV2 {
+                root_lines.insert(
+                    direction,
+                    CompletedRootLine {
+                        depth,
+                        path: worst_response.path.clone(),
+                        certainty: worst_response.certainty,
+                        adversarially_complete: direction_exhaustive,
+                    },
+                );
+            }
+            if let Some(first) = worst_response.path.first() {
+                graph.record_worst_reply(node_id, direction, first.joint_action.clone());
+            }
+            if pruned {
+                continue;
+            }
+            if best.as_ref().is_none_or(|previous| {
+                compare_routes(&worst_response, previous).is_gt()
+                    || (compare_routes(&worst_response, previous).is_eq()
+                        && direction.rank()
+                            < direction_of_first(graph, node_id, &previous.path)
+                                .map_or(u8::MAX, Direction::rank))
+            }) {
+                best = Some(worst_response);
+            }
+        } else {
+            all_directions_exhaustive = false;
+        }
+    }
+    if is_root && ordering_mode == RootSearchOrdering::ConservativeV2 {
+        // V2 alone retains full root paths for retrospective verification.
+        // The primary policy must not clone or retain unused diagnostic lines.
+        cache.completed_root_lines = root_lines;
+    }
+    if let Some(chosen) = best.as_mut() {
+        chosen.exhaustive = all_directions_exhaustive;
+        let direction = direction_of_first(graph, node_id, &chosen.path);
+        graph.record_search(
+            node_id,
+            depth,
+            CachedSearchValue {
+                score: chosen.rank.score,
+                safety: chosen.rank.safety,
+                depth,
+                certainty: chosen.certainty,
+            },
+            direction,
+        );
+    }
+    Ok(best)
+}
+
+fn worst_safety(left: TrapAssessment, right: TrapAssessment) -> TrapAssessment {
+    use TrapAssessment::{Constrained, ForcedCorridor, ProvenTrap, Unknown, Viable};
+    match (left, right) {
+        (ProvenTrap, _) | (_, ProvenTrap) => ProvenTrap,
+        (ForcedCorridor, _) | (_, ForcedCorridor) => ForcedCorridor,
+        (Constrained, _) | (_, Constrained) => Constrained,
+        (Unknown, _) | (_, Unknown) => Unknown,
+        (Viable, Viable) => Viable,
+    }
+}
+
+fn direction_of_first(graph: &FutureGraph, node: NodeId, path: &FuturePath) -> Option<Direction> {
+    let state = &graph.node(node).state;
+    let our_actor = state.actor_index(&state.our_snake_id)?;
+    path.first()?.joint_action.direction_for(our_actor)
+}
+
+fn evaluate_leaf(graph: &FutureGraph, node_id: NodeId) -> ScoredLeaf {
+    let state = &graph.node(node_id).state;
+    let Some(actor) = state.actor_index(&state.our_snake_id) else {
+        return ScoredLeaf {
+            rank: RouteRank {
+                score: StateScore::Loss,
+                safety: TrapAssessment::Unknown,
+                pressure: 0,
+            },
+            territory: None,
+        };
+    };
+    let params = HobbsScoreParams::STANDARD;
+    let territory = TemporalTerritory::from_state(state, params.fill_cycles, params.cell_weights);
+    let score = evaluate_hobbs_state(state, &territory, actor, params).score;
+    let snapshot = TerritorySnapshot::from_territory(state, &territory);
+    let survival = assess_survival_state(state);
+    let (safety, pressure) = corridor_tactics(state, score, survival);
+    ScoredLeaf {
+        rank: RouteRank {
+            score,
+            safety,
+            pressure,
+        },
+        territory: snapshot,
+    }
+}
+
+// The leaf of a deep minimax search already represents several actual joint
+// turns. Keep the extra tactical projection short and strictly demand-driven;
+// the full four-cycle projection is cached for near-root ordering.
+const LEAF_CORRIDOR_HORIZON: u8 = 3;
+
+/// Only verify expensive local continuations if some living snake is
+/// down to a single deterministic next move. Exact MIN responses remain
+/// responsible for proving whether an opponent can escape.
+fn corridor_tactics(
+    state: &crate::simulation::state::SimulatedGameState,
+    score: StateScore,
+    safety: TrapAssessment,
+) -> (TrapAssessment, u8) {
+    if !matches!(score, StateScore::Normal { .. }) || matches!(safety, TrapAssessment::ProvenTrap) {
+        return (safety, 0);
+    }
+    let mobility = MobilityAnalysis::from_state(state);
+    if !state
+        .snakes
+        .iter()
+        .filter(|snake| snake.alive)
+        .any(|snake| mobility.deterministic_moves_for(state, &snake.id).len() <= 1)
+    {
+        return (safety, 0);
+    }
+
+    let Some(ours) = CorridorOutlook::from_state(state, &state.our_snake_id, LEAF_CORRIDOR_HORIZON)
+    else {
+        return (safety, 0);
+    };
+    // One projected first exit can still lead to a sustainable circulation.
+    // Penalize only the absence of ANY projected continuation; the existing
+    // structural guard handles one-lane threats from stronger opponents.
+    let safety = if ours.continuing_exits == 0 {
+        worst_safety(safety, TrapAssessment::ForcedCorridor)
+    } else {
+        safety
+    };
+    // A prospective enemy restriction only matters if we maintain more than
+    // one possible route ourselves. No tactical forecast implies a forced win.
+    let pressure = if ours.continuing_exits >= 2 {
+        state
+            .snakes
+            .iter()
+            .filter(|snake| snake.alive && snake.id != state.our_snake_id)
+            .filter_map(|enemy| {
+                CorridorOutlook::from_state(state, &enemy.id, LEAF_CORRIDOR_HORIZON).map(
+                    |outlook| match outlook.continuing_exits {
+                        0 => 2,
+                        1 => 1,
+                        _ => 0,
+                    },
+                )
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    (safety, pressure)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulation::state::{RulesContext, SimulatedGameState, SimulatedSnake};
+    use crate::Coord;
+    use std::time::Duration;
+
+    fn snake(id: &str, x: i32, y: i32, length: usize) -> SimulatedSnake {
+        SimulatedSnake {
+            id: id.to_string(),
+            health: 100,
+            body: vec![Coord { x, y }; length],
+            alive: true,
+        }
+    }
+
+    fn state() -> SimulatedGameState {
+        SimulatedGameState {
+            turn: 0,
+            width: 7,
+            height: 7,
+            food: vec![Coord { x: 3, y: 4 }],
+            hazards: vec![],
+            snakes: vec![snake("ours", 1, 2, 3), snake("enemy", 5, 5, 3)],
+            our_snake_id: "ours".to_string(),
+            rules: RulesContext {
+                name: "standard".to_string(),
+                max_health: 100,
+                hazard_damage_per_turn: 0,
+            },
+        }
+    }
+
+    fn route(score: StateScore, safety: TrapAssessment, terminal_plies: Option<u16>) -> Route {
+        Route {
+            rank: RouteRank {
+                score,
+                safety,
+                pressure: 0,
+            },
+            path: FuturePath::empty(),
+            certainty: ForecastCertainty::Deterministic,
+            terminal_plies,
+            exhaustive: true,
+        }
+    }
+
+    #[test]
+    fn longer_forced_survival_beats_immediate_loss() {
+        let collision = route(StateScore::Loss, TrapAssessment::Viable, Some(1));
+        let delayed = route(StateScore::Loss, TrapAssessment::ForcedCorridor, Some(4));
+        assert!(compare_routes(&delayed, &collision).is_gt());
+    }
+
+    #[test]
+    fn losing_corner_line_does_not_beat_safer_route_on_delay_alone() {
+        let safer = route(StateScore::Loss, TrapAssessment::Viable, Some(3));
+        let corner = route(StateScore::Loss, TrapAssessment::ForcedCorridor, Some(5));
+        assert!(compare_routes(&safer, &corner).is_gt());
+    }
+
+    #[test]
+    fn local_alpha_cuts_only_while_max_action_cannot_improve() {
+        let incumbent = route(
+            StateScore::Normal { utility_milli: 500 },
+            TrapAssessment::Viable,
+            None,
+        );
+        let losing = route(
+            StateScore::Normal { utility_milli: 250 },
+            TrapAssessment::Viable,
+            None,
+        );
+        let promising = route(
+            StateScore::Normal { utility_milli: 650 },
+            TrapAssessment::Viable,
+            None,
+        );
+        assert!(alpha_cuts_reply(&incumbent, &losing));
+        assert!(!alpha_cuts_reply(&incumbent, &promising));
+    }
+
+    #[test]
+    fn forced_win_prefers_shorter_line() {
+        let quick = route(StateScore::Win, TrapAssessment::Viable, Some(2));
+        let slow = route(StateScore::Win, TrapAssessment::Viable, Some(6));
+        assert!(compare_routes(&quick, &slow).is_gt());
+    }
+
+    /// State captured from the actual 20261004 match at turn 286.
+    /// Right means an avoidable head-to-head with a 30-segment Hobbs.
+    fn recorded_hobbs_20261004_turn_286() -> SimulatedGameState {
+        fn body(points: &[(i32, i32)]) -> Vec<Coord> {
+            points.iter().map(|&(x, y)| Coord { x, y }).collect()
+        }
+        SimulatedGameState {
+            turn: 286,
+            width: 11,
+            height: 11,
+            food: body(&[(7, 1)]),
+            hazards: Vec::new(),
+            snakes: vec![
+                SimulatedSnake {
+                    id: "ours".into(),
+                    health: 98,
+                    alive: true,
+                    body: body(&[
+                        (5, 9),
+                        (5, 8),
+                        (5, 7),
+                        (5, 6),
+                        (4, 6),
+                        (3, 6),
+                        (2, 6),
+                        (1, 6),
+                        (1, 7),
+                        (1, 8),
+                        (2, 8),
+                        (2, 7),
+                        (3, 7),
+                        (3, 8),
+                        (3, 9),
+                        (2, 9),
+                        (1, 9),
+                        (0, 9),
+                        (0, 8),
+                        (0, 7),
+                        (0, 6),
+                        (0, 5),
+                        (0, 4),
+                        (1, 4),
+                        (2, 4),
+                        (3, 4),
+                        (4, 4),
+                        (4, 5),
+                        (5, 5),
+                    ]),
+                },
+                SimulatedSnake {
+                    id: "hobbs".into(),
+                    health: 85,
+                    alive: true,
+                    body: body(&[
+                        (6, 8),
+                        (6, 7),
+                        (6, 6),
+                        (7, 6),
+                        (7, 5),
+                        (7, 4),
+                        (7, 3),
+                        (6, 3),
+                        (6, 4),
+                        (5, 4),
+                        (5, 3),
+                        (4, 3),
+                        (3, 3),
+                        (2, 3),
+                        (1, 3),
+                        (1, 2),
+                        (0, 2),
+                        (0, 1),
+                        (0, 0),
+                        (1, 0),
+                        (1, 1),
+                        (2, 1),
+                        (2, 0),
+                        (3, 0),
+                        (4, 0),
+                        (5, 0),
+                        (6, 0),
+                        (7, 0),
+                        (8, 0),
+                        (9, 0),
+                    ]),
+                },
+            ],
+            our_snake_id: "ours".into(),
+            rules: RulesContext {
+                name: "standard".into(),
+                max_health: 100,
+                hazard_damage_per_turn: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn recorded_turn_286_prioritizes_surviving_the_next_turn() {
+        use crate::simulation::resolver::resolve_turn;
+        let state = recorded_hobbs_20261004_turn_286();
+        let us = state.actor_index("ours").unwrap();
+        let enemy = state.actor_index("hobbs").unwrap();
+        let right = JointAction::new()
+            .with_move(us, Direction::Right)
+            .with_move(enemy, Direction::Up);
+        let up = JointAction::new()
+            .with_move(us, Direction::Up)
+            .with_move(enemy, Direction::Up);
+        assert!(
+            !resolve_turn(&state, &right)
+                .unwrap()
+                .state
+                .snake("ours")
+                .unwrap()
+                .alive
+        );
+        assert!(
+            resolve_turn(&state, &up)
+                .unwrap()
+                .state
+                .snake("ours")
+                .unwrap()
+                .alive
+        );
+
+        let mut graph = FutureGraph::new_beam(state);
+        let budget = SearchBudget::for_duration(Duration::from_secs(2));
+        let mut scored = ScoredCache::new();
+        let root = graph.root();
+        let selected = evaluate_minimax(
+            &mut graph,
+            root,
+            1,
+            ForecastCertainty::Deterministic,
+            &budget,
+            &mut scored,
+            RootSearchOrdering::Baseline,
+        )
+        .unwrap()
+        .unwrap();
+        let direction = selected
+            .path
+            .first()
+            .unwrap()
+            .joint_action
+            .direction_for(us)
+            .unwrap();
+        assert_ne!(
+            direction,
+            Direction::Right,
+            "never prefer immediate losing head-to-head"
+        );
+    }
+
+    #[test]
+    fn loss_tie_prefers_less_restricted_escape() {
+        let less_restricted = RouteRank {
+            score: StateScore::Loss,
+            safety: TrapAssessment::Constrained,
+            pressure: 0,
+        };
+        let forced = RouteRank {
+            score: StateScore::Loss,
+            safety: TrapAssessment::ForcedCorridor,
+            pressure: 0,
+        };
+        assert!(less_restricted > forced);
+    }
+
+    #[test]
+    fn forecast_preserves_worst_intermediate_safety() {
+        assert_eq!(
+            worst_safety(TrapAssessment::Viable, TrapAssessment::Constrained),
+            TrapAssessment::Constrained
+        );
+        assert_eq!(
+            worst_safety(TrapAssessment::Constrained, TrapAssessment::ProvenTrap),
+            TrapAssessment::ProvenTrap
+        );
+    }
+
+    #[test]
+    fn terminal_win_outweighs_nonterminal_viability() {
+        let win = RouteRank {
+            score: StateScore::Win,
+            safety: TrapAssessment::Unknown,
+            pressure: 0,
+        };
+        let normal = RouteRank {
+            score: StateScore::Normal {
+                utility_milli: 2000,
+            },
+            safety: TrapAssessment::Viable,
+            pressure: 0,
+        };
+        assert!(win > normal);
+    }
+
+    #[test]
+    fn constrained_exit_loses_to_viable_alternative_without_score_weight() {
+        let constrained = RouteRank {
+            score: StateScore::Normal {
+                utility_milli: 1000,
+            },
+            safety: TrapAssessment::Constrained,
+            pressure: 0,
+        };
+        let viable = RouteRank {
+            score: StateScore::Normal {
+                utility_milli: -200,
+            },
+            safety: TrapAssessment::Viable,
+            pressure: 0,
+        };
+        assert!(viable > constrained);
+        assert!(
+            constrained
+                > RouteRank {
+                    score: StateScore::Tie,
+                    safety: TrapAssessment::Unknown,
+                    pressure: 0,
+                }
+        );
+    }
+
+    #[test]
+    fn corridor_pressure_is_a_tactical_tiebreaker_not_a_proven_win() {
+        let safe = RouteRank {
+            score: StateScore::Normal { utility_milli: 500 },
+            safety: TrapAssessment::Viable,
+            pressure: 0,
+        };
+        let threatening = RouteRank {
+            score: StateScore::Normal { utility_milli: 480 },
+            safety: TrapAssessment::Viable,
+            pressure: 2,
+        };
+        let reckless = RouteRank {
+            score: StateScore::Normal { utility_milli: 450 },
+            safety: TrapAssessment::Viable,
+            pressure: 2,
+        };
+        let unsafe_attack = RouteRank {
+            score: StateScore::Normal {
+                utility_milli: 1000,
+            },
+            safety: TrapAssessment::ForcedCorridor,
+            pressure: 2,
+        };
+        assert!(threatening > safe);
+        assert!(
+            safe > reckless,
+            "small corridor hints cannot override strong territory"
+        );
+        assert!(safe > unsafe_attack);
+        assert!(
+            RouteRank {
+                score: StateScore::Win,
+                safety: TrapAssessment::Unknown,
+                pressure: 0,
+            } > threatening
+        );
+    }
+
+    #[test]
+    fn legacy_root_order_matches_winning_revision_for_complete_and_missing_hints() {
+        let cases = [
+            (None, HashMap::new()),
+            (
+                Some(Direction::Right),
+                HashMap::from([
+                    (Direction::Up, (2, 1)),
+                    (Direction::Right, (2, 3)),
+                    (Direction::Left, (0, 0)),
+                ]),
+            ),
+            (
+                Some(Direction::Down),
+                HashMap::from([
+                    (Direction::Up, (0, 1)),
+                    (Direction::Right, (3, 3)),
+                    (Direction::Down, (1, 1)),
+                    (Direction::Left, (4, 2)),
+                ]),
+            ),
+        ];
+        for (preferred, hints) in cases {
+            let mut actual = Direction::ALL.to_vec();
+            baseline_root_order(&mut actual, preferred, &hints);
+            let mut expected = Direction::ALL.to_vec();
+            expected.sort_by_key(|direction| {
+                let (our_exits, their_exits) =
+                    hints.get(direction).copied().unwrap_or((0, u8::MAX));
+                (
+                    our_exits == 0,
+                    Some(*direction) != preferred,
+                    std::cmp::Reverse(our_exits),
+                    their_exits,
+                    direction.rank(),
+                )
+            });
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn root_direction_evidence_comes_from_one_completed_depth() {
+        let mut graph = FutureGraph::new_beam(state());
+        let root = graph.root();
+        let budget = SearchBudget::for_duration(Duration::from_secs(4));
+        let mut scored = ScoredCache::new();
+        let result = evaluate_minimax(
+            &mut graph,
+            root,
+            2,
+            ForecastCertainty::Deterministic,
+            &budget,
+            &mut scored,
+            RootSearchOrdering::ConservativeV2,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!result.path.is_empty());
+        assert!(!scored.completed_root_lines.is_empty());
+        assert!(scored
+            .completed_root_lines
+            .values()
+            .all(|line| line.depth == 2));
+        for (direction, line) in &scored.completed_root_lines {
+            assert_eq!(line.path.len(), 2);
+            if line.adversarially_complete {
+                assert_eq!(
+                    graph.response_coverage(root, *direction),
+                    super::super::graph::ResponseCoverage::Complete
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_root_directions_receive_a_pessimistic_answer() {
+        let mut graph = FutureGraph::new_beam(state());
+        let budget = SearchBudget::for_duration(Duration::from_secs(4));
+        let result = search_hobbs(&mut graph, &budget).unwrap().unwrap();
+        assert!(result.completed_depth >= 1);
+        assert!(result.root_directions >= 2);
+        let our_actor = graph.node(graph.root()).state.actor_index("ours").unwrap();
+        assert!(graph
+            .node(graph.root())
+            .children
+            .iter()
+            .any(|edge| edge.joint_action.direction_for(our_actor) == Some(result.direction)));
+    }
+
+    #[test]
+    fn no_depth_is_committed_when_budget_is_empty() {
+        let mut graph = FutureGraph::new_beam(state());
+        let budget = SearchBudget::for_duration(Duration::ZERO);
+        assert!(search_hobbs(&mut graph, &budget).unwrap().is_none());
+    }
+
+    /// Re-evaluate a FIXED first move against all enemy replies reachable
+    /// within the same minimax rules. Never changes the production selector.
+    /// Only a completed horizon is comparable between candidate directions.
+    fn historical_forced_root_at_depth(
+        graph: &mut FutureGraph,
+        direction: Direction,
+        depth: u8,
+        budget: &SearchBudget,
+    ) -> Result<Option<(Route, bool)>, SearchError> {
+        let root = graph.root();
+        let mut scored = ScoredCache::new();
+        let mut next_index = 0;
+        let mut worst: Option<Route> = None;
+        let mut exhaustive = true;
+        loop {
+            let edge = match graph.next_response(root, direction, next_index, budget)? {
+                ResponseLookup::Edge(edge) => edge,
+                ResponseLookup::Exhausted => break,
+                ResponseLookup::Deadline => return Ok(None),
+            };
+            next_index += 1;
+            let Some(mut candidate) = evaluate_minimax(
+                graph,
+                edge.child,
+                depth.saturating_sub(1),
+                ForecastCertainty::Deterministic.after(edge.forecast_delta),
+                budget,
+                &mut scored,
+                RootSearchOrdering::PrimaryV3,
+            )?
+            else {
+                return Ok(None);
+            };
+            exhaustive &= candidate.exhaustive;
+            candidate.terminal_plies = candidate
+                .terminal_plies
+                .map(|plies| plies.saturating_add(1));
+            candidate.rank.safety = worst_safety(
+                candidate.rank.safety,
+                assess_survival_state(&graph.node(edge.child).state),
+            );
+            candidate.path = candidate.path.prepend(FutureStep {
+                node: root,
+                joint_action: edge.joint_action,
+                child: edge.child,
+            });
+            if worst
+                .as_ref()
+                .is_none_or(|previous| compare_routes(&candidate, previous).is_lt())
+            {
+                worst = Some(candidate);
+            }
+        }
+        exhaustive &= graph.response_coverage(root, direction)
+            == super::super::graph::ResponseCoverage::Complete;
+        Ok(worst.map(|route| (route, exhaustive)))
+    }
+
+    /// Unlike a selected-line hint, this evaluates candidate first moves
+    /// independently under MAX/MIN, without root alpha cuts. It reports
+    /// incomplete horizons explicitly; it never labels them as winning.
+    #[test]
+    fn historical_v3_forced_root_alternatives() {
+        let Ok(folder) = std::env::var("SNAKE_V3_REGRESSION_FIXTURES") else {
+            return;
+        };
+        let targets = [
+            "20261002-570",
+            "20261002-575",
+            "20261002-578",
+            "20261011-299",
+            "20261011-300",
+            "20261011-302",
+            "20261011-304",
+            "20261011-305",
+            "20261014-416",
+            "20261014-418",
+            "20261014-420",
+            "20261014-421",
+            "20261015-458",
+            "20261015-462",
+            "20261015-464",
+            "20261015-466",
+        ];
+        for target in targets {
+            let file = format!("{target}.json");
+            let pinned = std::path::Path::new(&folder).join(&file);
+            let path = if pinned.exists() {
+                pinned
+            } else {
+                std::path::Path::new(&folder).join("backtrack").join(file)
+            };
+            let raw = std::fs::read_to_string(&path).expect("read pinned state");
+            let state: crate::GameState =
+                serde_json::from_str(&raw).expect("deserialize pinned state");
+            let initial = crate::simulation::state::SimulatedGameState::from(&state);
+            let mut candidate_graph = FutureGraph::new_beam(initial.clone());
+            let directions = candidate_graph.available_directions(candidate_graph.root());
+            if directions.len() < 2 {
+                println!(
+                    "V3_FORCED_ROOT case={target} no_alternative=true directions={directions:?}"
+                );
+                continue;
+            }
+            for direction in directions {
+                let mut graph = FutureGraph::new_beam(initial.clone());
+                // Only the compact self-trap case receives a longer horizon.
+                // Each candidate still gets its own identical time budget.
+                let long_horizon = target.starts_with("20261015-");
+                let budget = SearchBudget::for_duration(Duration::from_millis(if long_horizon {
+                    1500
+                } else {
+                    600
+                }));
+                let mut last_complete: Option<(u8, Route, bool)> = None;
+                let depth_limit = if long_horizon { 20 } else { 7 };
+                for depth in 1..=depth_limit {
+                    if budget.expired() {
+                        break;
+                    }
+                    match historical_forced_root_at_depth(&mut graph, direction, depth, &budget)
+                        .expect("forced root evaluation must not error")
+                    {
+                        Some((route, exhaustive)) => {
+                            last_complete = Some((depth, route, exhaustive));
+                        }
+                        None => break,
+                    }
+                }
+                if let Some((depth, route, exhaustive)) = last_complete {
+                    println!(
+                        "V3_FORCED_ROOT case={target} direction={direction:?} depth={depth} score={:?} safety={:?} terminal_plies={:?} exhaustive={exhaustive} certainty={:?} nodes={}",
+                        route.rank.score,
+                        route.rank.safety,
+                        route.terminal_plies,
+                        route.certainty,
+                        graph.node_count(),
+                    );
+                } else {
+                    println!("V3_FORCED_ROOT case={target} direction={direction:?} depth=0 inconclusive=true");
+                }
+            }
+        }
+    }
+
+    /// Pinned historical game states: real Rust decision path, not a geometric
+    /// approximation. Only runs when the GitHub regression workflow supplies
+    /// fixtures from the immutable duel run.
+    #[test]
+    fn historical_v3_graph_replays_real_trap_positions() {
+        let Ok(folder) = std::env::var("SNAKE_V3_REGRESSION_FIXTURES") else {
+            return;
+        };
+        let mut paths: Vec<_> = std::fs::read_dir(folder)
+            .expect("historical fixtures directory must exist")
+            .map(|entry| entry.expect("read fixture").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        paths.sort();
+        assert_eq!(paths.len(), 12, "expected three states per losing seed");
+        for path in paths {
+            let raw = std::fs::read_to_string(&path).expect("read real match state");
+            let state: crate::GameState =
+                serde_json::from_str(&raw).expect("deserialize real Battlesnake request");
+            let mut graph =
+                FutureGraph::new_beam(crate::simulation::state::SimulatedGameState::from(&state));
+            let root = graph.root();
+            let legal = graph.available_directions(root);
+            assert!(!legal.is_empty(), "{path:?}: no candidate actions");
+            let budget = SearchBudget::for_duration(Duration::from_millis(350));
+            let decision = search_hobbs_ordering_v3(&mut graph, &budget)
+                .expect("simulation must not fail")
+                .expect("search must return a completed depth");
+            assert!(
+                legal.contains(&decision.direction),
+                "{path:?}: selected an unavailable direction"
+            );
+            let actor = graph
+                .node(root)
+                .state
+                .actor_index(&state.you.id)
+                .expect("our snake is present");
+            let cached_replies = graph.known_responses(root, decision.direction);
+            let sampled = cached_replies.len();
+            let immediate_terminal_replies = cached_replies
+                .iter()
+                .filter(|edge| {
+                    !graph
+                        .node(edge.child)
+                        .state
+                        .snake_at(actor)
+                        .is_some_and(|snake| snake.alive)
+                })
+                .count();
+            println!(
+                "V3_HISTORICAL seed_turn={:?} chosen={:?} depth={} legal={:?} cached_replies={} terminal_replies={}",
+                path.file_stem(), decision.direction, decision.completed_depth,
+                legal, sampled, immediate_terminal_replies
+            );
+            // Characterization only: reuse the existing cached FutureGraph.
+            // Never infer safety from partial response coverage or horizon.
+            for direction in legal.iter().copied() {
+                let replies = graph.known_responses(root, direction);
+                let coverage = graph.response_coverage(root, direction);
+                let mut tactical_cache = ScoredCache::new();
+                let mut min_our_exits = u8::MAX;
+                let mut max_enemy_exits = 0_u8;
+                for edge in &replies {
+                    let tactical = tactical_cache.corridor(&graph, edge.child);
+                    min_our_exits = min_our_exits.min(tactical.our_continuations());
+                    max_enemy_exits = max_enemy_exits.max(tactical.enemy_continuations());
+                }
+                let terminal_count = replies
+                    .iter()
+                    .filter(|edge| {
+                        !graph
+                            .node(edge.child)
+                            .state
+                            .snake_at(actor)
+                            .is_some_and(|snake| snake.alive)
+                    })
+                    .count();
+                let mut territory_cache = HashMap::new();
+                let sample = TerritoryDirectionSample::from_cached_replies(
+                    &graph,
+                    direction,
+                    &mut territory_cache,
+                    |_| None,
+                    true,
+                    Instant::now() + Duration::from_millis(70),
+                );
+                println!(
+                    "V3_COUNTERFACTUAL state={:?} direction={:?} selected={} coverage={:?} replies={} tactical_our_exits={} tactical_enemy_exits={} immediate_deaths={} territory={:?}",
+                    path.file_stem(),
+                    direction,
+                    direction == decision.direction,
+                    coverage,
+                    replies.len(),
+                    min_our_exits,
+                    max_enemy_exits,
+                    terminal_count,
+                    sample.map(|hint| (
+                        hint.examined_replies,
+                        hint.min_sampled_depth,
+                        hint.max_sampled_depth,
+                        hint.worst_mean_margin_milli,
+                        hint.worst_minimum_margin_milli,
+                        hint.territorial_drop,
+                        hint.terminal_reply_seen,
+                        hint.certainty,
+                    ))
+                );
+                let nodes_before = graph.node_count();
+                let edges_before = graph.edge_count();
+                let mut trial_cache = HashMap::new();
+                let extended = TerritoryDirectionSample::from_cached_replies_trial(
+                    &graph,
+                    direction,
+                    &mut trial_cache,
+                    |_| None,
+                    true,
+                    Instant::now() + Duration::from_millis(70),
+                );
+                assert_eq!(
+                    graph.node_count(),
+                    nodes_before,
+                    "trial must not expand nodes"
+                );
+                assert_eq!(
+                    graph.edge_count(),
+                    edges_before,
+                    "trial must not expand edges"
+                );
+                println!(
+                    "V3_SAMPLING_TRIAL state={:?} direction={:?} baseline={:?} extended={:?}",
+                    path.file_stem(),
+                    direction,
+                    sample.map(|hint| (
+                        hint.examined_replies,
+                        hint.max_sampled_depth,
+                        hint.territorial_drop,
+                    )),
+                    extended.map(|hint| (
+                        hint.examined_replies,
+                        hint.max_sampled_depth,
+                        hint.territorial_drop,
+                    )),
+                );
+            }
+            // Fail only for a fully proven one-ply mistake. Partial coverage
+            // is not evidence that a move is safe or inevitably fatal.
+            let classified = |direction: Direction| {
+                let replies = graph.known_responses(root, direction);
+                if replies.is_empty()
+                    || graph.response_coverage(root, direction)
+                        != super::super::graph::ResponseCoverage::Complete
+                {
+                    return None;
+                }
+                let deaths = replies
+                    .iter()
+                    .filter(|edge| {
+                        !graph
+                            .node(edge.child)
+                            .state
+                            .snake_at(actor)
+                            .is_some_and(|snake| snake.alive)
+                    })
+                    .count();
+                Some((deaths, replies.len()))
+            };
+            let proven_forced_death =
+                classified(decision.direction).is_some_and(|(deaths, total)| deaths == total);
+            let proven_immediate_survivor = legal
+                .iter()
+                .copied()
+                .find(|direction| classified(*direction).is_some_and(|(deaths, _)| deaths == 0));
+            assert!(
+                !proven_forced_death || proven_immediate_survivor.is_none(),
+                "{path:?}: forced immediate death chosen despite fully covered survivor {proven_immediate_survivor:?}"
+            );
+        }
+    }
+}

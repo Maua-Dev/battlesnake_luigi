@@ -83,6 +83,7 @@ resource "aws_lambda_function" "battlesnake" {
   environment {
     variables = {
       RUST_LOG = "info"
+      SNAKE_TERRITORY_MODE = "ordering_v3"
     }
   }
 }

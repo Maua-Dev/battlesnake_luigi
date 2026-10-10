@@ -1,0 +1,265 @@
+use serde_json::Value;
+
+use crate::{Battlesnake, Coord, GameState};
+
+pub(crate) const DEFAULT_MAX_HEALTH: i32 = 100;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SimulationSupport {
+    StandardLike,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RulesContext {
+    pub(crate) name: String,
+    pub(crate) max_health: i32,
+    pub(crate) hazard_damage_per_turn: i32,
+}
+
+impl RulesContext {
+    pub(crate) fn simulation_support(&self) -> SimulationSupport {
+        match self.name.as_str() {
+            "standard" => SimulationSupport::StandardLike,
+            _ => SimulationSupport::Unsupported,
+        }
+    }
+
+    fn from_state(state: &GameState) -> Self {
+        let name = state
+            .game
+            .ruleset
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("standard")
+            .to_string();
+
+        let settings = state
+            .game
+            .ruleset
+            .get("settings")
+            .and_then(Value::as_object);
+        let hazard_damage_per_turn = settings
+            .and_then(|settings| settings.get("hazardDamagePerTurn"))
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0);
+
+        Self {
+            name,
+            max_health: DEFAULT_MAX_HEALTH,
+            hazard_damage_per_turn,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ActorIndex(u8);
+
+impl ActorIndex {
+    pub(crate) fn new(index: usize) -> Option<Self> {
+        u8::try_from(index).ok().map(Self)
+    }
+
+    pub(crate) const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SimulatedSnake {
+    pub(crate) id: String,
+    pub(crate) health: i32,
+    pub(crate) body: Vec<Coord>,
+    pub(crate) alive: bool,
+}
+
+impl SimulatedSnake {
+    pub(crate) fn head(&self) -> Option<Coord> {
+        self.body.first().copied()
+    }
+
+    pub(crate) fn length(&self) -> usize {
+        self.body.len()
+    }
+}
+
+impl From<&Battlesnake> for SimulatedSnake {
+    fn from(snake: &Battlesnake) -> Self {
+        Self {
+            id: snake.id.clone(),
+            health: snake.health,
+            body: snake.body.clone(),
+            alive: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SimulatedGameState {
+    pub(crate) turn: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) food: Vec<Coord>,
+    pub(crate) hazards: Vec<Coord>,
+    pub(crate) snakes: Vec<SimulatedSnake>,
+    pub(crate) our_snake_id: String,
+    pub(crate) rules: RulesContext,
+}
+
+impl SimulatedGameState {
+    pub(crate) fn actor_index(&self, id: &str) -> Option<ActorIndex> {
+        self.snakes
+            .iter()
+            .position(|snake| snake.id == id)
+            .and_then(ActorIndex::new)
+    }
+
+    pub(crate) fn actor_id(&self, index: ActorIndex) -> Option<&str> {
+        self.snakes
+            .get(index.as_usize())
+            .map(|snake| snake.id.as_str())
+    }
+
+    pub(crate) fn snake_at(&self, index: ActorIndex) -> Option<&SimulatedSnake> {
+        self.snakes.get(index.as_usize())
+    }
+
+    pub(crate) fn snake(&self, id: &str) -> Option<&SimulatedSnake> {
+        self.snakes.iter().find(|snake| snake.id == id)
+    }
+
+    pub(crate) fn snake_mut(&mut self, id: &str) -> Option<&mut SimulatedSnake> {
+        self.snakes.iter_mut().find(|snake| snake.id == id)
+    }
+}
+
+impl From<&GameState> for SimulatedGameState {
+    fn from(state: &GameState) -> Self {
+        Self {
+            turn: state.turn,
+            width: state.board.width,
+            height: state.board.height,
+            food: state.board.food.clone(),
+            hazards: state.board.hazards.clone(),
+            snakes: state
+                .board
+                .snakes
+                .iter()
+                .map(SimulatedSnake::from)
+                .collect(),
+            our_snake_id: state.you.id.clone(),
+            rules: RulesContext::from_state(state),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::{Board, Game};
+
+    fn snake(id: &str, health: i32, body: Vec<Coord>) -> Battlesnake {
+        Battlesnake {
+            id: id.to_string(),
+            name: id.to_string(),
+            health,
+            head: body[0],
+            length: body.len() as u32,
+            body,
+            latency: String::new(),
+            shout: None,
+        }
+    }
+
+    #[test]
+    fn actor_index_is_stable_for_snake_order() {
+        let ours = snake("ours", 87, vec![Coord { x: 2, y: 2 }]);
+        let enemy = snake("enemy", 90, vec![Coord { x: 5, y: 5 }]);
+        let state = GameState {
+            game: Game {
+                id: "game".to_string(),
+                ruleset: HashMap::from([
+                    ("name".to_string(), json!("standard")),
+                    ("settings".to_string(), json!({ "hazardDamagePerTurn": 0 })),
+                ]),
+                timeout: 500,
+            },
+            turn: 1,
+            board: Board {
+                height: 11,
+                width: 11,
+                food: vec![],
+                snakes: vec![ours.clone(), enemy.clone()],
+                hazards: vec![],
+            },
+            you: ours,
+        };
+        let simulated = SimulatedGameState::from(&state);
+
+        let ours_index = simulated.actor_index("ours").unwrap();
+        let enemy_index = simulated.actor_index("enemy").unwrap();
+
+        assert_eq!(ours_index.as_usize(), 0);
+        assert_eq!(enemy_index.as_usize(), 1);
+        assert_eq!(simulated.actor_id(ours_index), Some("ours"));
+        assert_eq!(simulated.actor_id(enemy_index), Some("enemy"));
+    }
+
+    #[test]
+    fn ruleset_support_is_explicit() {
+        let standard = RulesContext {
+            name: "standard".to_string(),
+            max_health: 100,
+            hazard_damage_per_turn: 0,
+        };
+        let constrictor = RulesContext {
+            name: "constrictor".to_string(),
+            max_health: 100,
+            hazard_damage_per_turn: 0,
+        };
+
+        assert_eq!(
+            standard.simulation_support(),
+            SimulationSupport::StandardLike
+        );
+        assert_eq!(
+            constrictor.simulation_support(),
+            SimulationSupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn converts_api_state_without_strategy_fields() {
+        let ours = snake("ours", 87, vec![Coord { x: 2, y: 2 }, Coord { x: 2, y: 1 }]);
+        let state = GameState {
+            game: Game {
+                id: "game".to_string(),
+                ruleset: HashMap::from([
+                    ("name".to_string(), json!("royale")),
+                    ("settings".to_string(), json!({ "hazardDamagePerTurn": 14 })),
+                ]),
+                timeout: 500,
+            },
+            turn: 9,
+            board: Board {
+                height: 11,
+                width: 11,
+                food: vec![Coord { x: 4, y: 4 }],
+                snakes: vec![ours.clone()],
+                hazards: vec![Coord { x: 5, y: 5 }],
+            },
+            you: ours,
+        };
+
+        let simulated = SimulatedGameState::from(&state);
+
+        assert_eq!(simulated.turn, 9);
+        assert_eq!(simulated.rules.name, "royale");
+        assert_eq!(simulated.rules.hazard_damage_per_turn, 14);
+        assert_eq!(simulated.snake("ours").unwrap().health, 87);
+    }
+}
