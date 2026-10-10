@@ -28,6 +28,7 @@ pub(crate) use v3_models::{Battlesnake, Board, Coord, Game, GameState};
 use lambda_http::{run, service_fn, Body, Error, Request, RequestPayloadExt, Response};
 use models::GameState as RequestGameState;
 use serde_json::{json, Value};
+use std::time::Instant;
 use tracing::error;
 
 #[tokio::main]
@@ -50,10 +51,13 @@ async fn handler(event: Request) -> Result<Response<Body>, Error> {
             Err(reason) => bad_request(reason),
         },
 
-        "/move" => match parse_state(&event) {
-            Ok(state) => json_response(200, logic::get_move(&state).await),
-            Err(reason) => bad_request(reason),
-        },
+        "/move" => {
+            let started = Instant::now();
+            match parse_state(&event) {
+                Ok(state) => json_response(200, logic::get_move(&state, started).await),
+                Err(reason) => bad_request(reason),
+            }
+        }
 
         "/end" => match parse_state(&event) {
             Ok(state) => {

@@ -62,16 +62,23 @@ impl GameRuntime {
             return crate::strategy::choose_move_baseline(state);
         }
 
+        // Lambda invocations can be routed to different warm environments.
+        // A /move without /start must still establish a reusable per-game graph.
         let session = {
-            let sessions = self.sessions.read().await;
-            sessions.get(&state.game.id).cloned()
+            let mut sessions = self.sessions.write().await;
+            if !sessions.contains_key(&state.game.id) {
+                warn!(
+                    "MOVE {} game={} lazy_session=true (no /start on this instance)",
+                    state.turn, state.game.id
+                );
+            }
+            Some(
+                sessions
+                    .entry(state.game.id.clone())
+                    .or_insert_with(|| Arc::new(GameSession::default()))
+                    .clone(),
+            )
         };
-        if session.is_none() {
-            warn!(
-                "received /move without active session for {}; using stateless search",
-                state.game.id
-            );
-        }
         let permit = match self.search_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -288,5 +295,13 @@ mod tests {
         runtime.end(&state("game-b")).await;
 
         assert_eq!(runtime.active_game_ids().await, vec!["game-a"]);
+    }
+
+    #[tokio::test]
+    async fn lambda_move_without_start_creates_reusable_warm_session() {
+        let runtime = GameRuntime::new();
+        let board = state("lazy-game");
+        let _first = runtime.decide(&board, Instant::now()).await;
+        assert_eq!(runtime.active_game_ids().await, vec!["lazy-game"]);
     }
 }

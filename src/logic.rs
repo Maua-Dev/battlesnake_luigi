@@ -24,11 +24,46 @@ pub fn info() -> Value {
 pub async fn start(input: &RequestGameState) {
     runtime().start(&crate::GameState::from(input)).await;
 }
-pub async fn get_move(input: &RequestGameState) -> Value {
-    // Include conversion work in the request-side search deadline.
-    let started = Instant::now();
+pub async fn get_move(input: &RequestGameState, started: Instant) -> Value {
+    // Stopwatch began BEFORE API payload parsing in the Lambda handler.
     let state = crate::GameState::from(input);
-    let decision = runtime().decide(&state, started).await;
+    let mut decision = runtime().decide(&state, started).await;
+    // Never return a provable immediate body/wall collision if another
+    // deterministic move exists, including after a timeout fallback.
+    let simulation = crate::simulation::state::SimulatedGameState::from(&state);
+    if let Some(ours) = simulation.snake(&simulation.our_snake_id) {
+        let mobility = crate::simulation::mobility::MobilityAnalysis::from_state(&simulation);
+        if mobility
+            .classify_move(&simulation, ours, decision.direction)
+            .is_some()
+        {
+            let fallback = crate::strategy::choose_move_baseline(&state);
+            if mobility
+                .classify_move(&simulation, ours, fallback.direction)
+                .is_none()
+            {
+                log::warn!(
+                    "lambda_guard game={} turn={} invalid_direction={:?} replacement={:?}",
+                    state.game.id,
+                    state.turn,
+                    decision.direction,
+                    fallback.direction
+                );
+                decision = fallback;
+            }
+        }
+    }
+    log::info!(
+        "lambda_move game={} turn={} direction={:?} reason={:?} depth={} nodes={} search_us={} request_us={}",
+        state.game.id,
+        state.turn,
+        decision.direction,
+        decision.reason,
+        decision.search.completed_depth,
+        decision.search.nodes,
+        decision.search.elapsed_us,
+        started.elapsed().as_micros()
+    );
     json!({"move": decision.direction.as_str()})
 }
 pub async fn end(input: &RequestGameState) {
