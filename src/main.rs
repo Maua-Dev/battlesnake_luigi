@@ -9,11 +9,24 @@
 //!   POST /move    -> escolha a jogada deste turno
 //!   POST /end     -> a partida acabou
 
+mod analysis;
+mod board_mask;
+mod decision;
+mod direction;
+mod evaluation;
 mod logic;
 mod models;
+mod navigation;
+mod runtime;
+mod search;
+mod simulation;
+mod spatial;
+mod strategy;
+mod v3_models;
+pub(crate) use v3_models::{Battlesnake, Board, Coord, Game, GameState};
 
 use lambda_http::{run, service_fn, Body, Error, Request, RequestPayloadExt, Response};
-use models::GameState;
+use models::GameState as RequestGameState;
 use serde_json::{json, Value};
 use tracing::error;
 
@@ -21,6 +34,7 @@ use tracing::error;
 async fn main() -> Result<(), Error> {
     // Configura os logs no formato que o CloudWatch entende. O nível vem da
     // variável RUST_LOG (definida no Terraform); o padrão é "info".
+    let _ = tracing_log::LogTracer::init();
     lambda_http::tracing::init_default_subscriber();
 
     run(service_fn(handler)).await
@@ -30,20 +44,20 @@ async fn handler(event: Request) -> Result<Response<Body>, Error> {
     match extract_route(event.uri().path()) {
         "/start" => match parse_state(&event) {
             Ok(state) => {
-                logic::start(&state);
+                logic::start(&state).await;
                 text_response(200, "ok")
             }
             Err(reason) => bad_request(reason),
         },
 
         "/move" => match parse_state(&event) {
-            Ok(state) => json_response(200, logic::get_move(&state)),
+            Ok(state) => json_response(200, logic::get_move(&state).await),
             Err(reason) => bad_request(reason),
         },
 
         "/end" => match parse_state(&event) {
             Ok(state) => {
-                logic::end(&state);
+                logic::end(&state).await;
                 text_response(200, "ok")
             }
             Err(reason) => bad_request(reason),
@@ -74,8 +88,8 @@ fn extract_route(path: &str) -> &'static str {
 
 /// Lê o corpo da requisição como um `GameState`. Devolve o motivo da falha em
 /// texto, para irmos direto ao ponto quando algo vier fora do esperado.
-fn parse_state(event: &Request) -> Result<GameState, String> {
-    match event.json::<GameState>() {
+fn parse_state(event: &Request) -> Result<RequestGameState, String> {
+    match event.json::<RequestGameState>() {
         Ok(Some(state)) => Ok(state),
         Ok(None) => Err("o corpo da requisição veio vazio".to_string()),
         Err(e) => Err(format!("JSON inválido: {e:?}")),
@@ -128,7 +142,9 @@ mod tests {
     fn request(method: &str, path: &str, body: &str) -> Request {
         http::Request::builder()
             .method(method)
-            .uri(format!("https://abc123.execute-api.us-east-1.amazonaws.com{path}"))
+            .uri(format!(
+                "https://abc123.execute-api.us-east-1.amazonaws.com{path}"
+            ))
             .header("Content-Type", "application/json")
             .body(Body::from(body.to_owned()))
             .unwrap()
@@ -168,7 +184,9 @@ mod tests {
 
     #[tokio::test]
     async fn move_devolve_uma_direcao_valida() {
-        let response = handler(request("POST", "/dev/move", GAME_STATE)).await.unwrap();
+        let response = handler(request("POST", "/dev/move", GAME_STATE))
+            .await
+            .unwrap();
         let body = std::str::from_utf8(response.body().as_ref()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
 
