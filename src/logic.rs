@@ -27,7 +27,34 @@ pub async fn start(input: &RequestGameState) {
 pub async fn get_move(input: &RequestGameState, started: Instant) -> Value {
     // Stopwatch began BEFORE API payload parsing in the Lambda handler.
     let state = crate::GameState::from(input);
+    // Cheap adversarial precheck is only needed when heads could meet next
+    // turn. It uses the exact FutureGraph action generator and resolver.
+    let simulated = crate::simulation::state::SimulatedGameState::from(&state);
+    let tactics = crate::analysis::RootTactics::when_head_contact_possible(
+        &simulated,
+        Instant::now() + std::time::Duration::from_millis(15),
+        16,
+    );
     let mut decision = runtime().decide(&state, started).await;
+    if let Some(report) = tactics.as_ref() {
+        if report.any_verified_safe() && report.demonstrated_loss(decision.direction) {
+            let previous = decision.direction;
+            let replacement =
+                crate::strategy::choose_move_baseline_with_tactics(&state, Some(report));
+            if report.verified_safe(replacement.direction) {
+                log::warn!(
+                    "lambda_tactical_guard game={} turn={} rejected={:?} reply={:?} selected={:?} selected_reply={:?}",
+                    state.game.id,
+                    state.turn,
+                    previous,
+                    report.entry(previous),
+                    replacement.direction,
+                    report.entry(replacement.direction)
+                );
+                decision = replacement;
+            }
+        }
+    }
     // Never return a provable immediate body/wall collision if another
     // deterministic move exists, including after a timeout fallback.
     let simulation = crate::simulation::state::SimulatedGameState::from(&state);

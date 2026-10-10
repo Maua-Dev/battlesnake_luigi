@@ -64,6 +64,19 @@ pub(crate) fn direction_stays_in_bounds(state: &GameState, direction: Direction)
 }
 
 pub(crate) fn choose_move_baseline(state: &GameState) -> Decision {
+    let simulated = crate::simulation::state::SimulatedGameState::from(state);
+    let tactics = crate::analysis::RootTactics::when_head_contact_possible(
+        &simulated,
+        std::time::Instant::now() + std::time::Duration::from_millis(12),
+        16,
+    );
+    choose_move_baseline_with_tactics(state, tactics.as_ref())
+}
+
+pub(crate) fn choose_move_baseline_with_tactics(
+    state: &GameState,
+    tactics: Option<&crate::analysis::RootTactics>,
+) -> Decision {
     // The time-budget fallback must avoid a provable body collision BEFORE
     // ranking food. It is used whenever the Lambda cannot finish MAX/MIN.
     let simulated = crate::simulation::state::SimulatedGameState::from(state);
@@ -103,7 +116,10 @@ pub(crate) fn choose_move_baseline(state: &GameState) -> Decision {
             let destination = direction.apply(state.you.head);
             let reachable =
                 mobility.reachable_space(&simulated, &simulated.our_snake_id, direction);
-            let contested_head = map.lethal_head_danger.contains(destination);
+            let safe = tactics.is_some_and(|report| report.verified_safe(direction));
+            let tactical_priority =
+                tactics.is_some_and(|report| report.any_verified_safe() && !safe);
+            let contested_head = !safe && map.lethal_head_danger.contains(destination);
             let cramped = reachable < state.you.length;
             let hazard = map.is_hazard(destination);
             let food_distance = state
@@ -116,6 +132,7 @@ pub(crate) fn choose_move_baseline(state: &GameState) -> Decision {
             (
                 direction,
                 reachable,
+                tactical_priority,
                 contested_head,
                 cramped,
                 hazard,
@@ -123,8 +140,17 @@ pub(crate) fn choose_move_baseline(state: &GameState) -> Decision {
             )
         })
         .min_by_key(
-            |(direction, reachable, contested_head, cramped, hazard, food_distance)| {
+            |(
+                direction,
+                reachable,
+                tactical_priority,
+                contested_head,
+                cramped,
+                hazard,
+                food_distance,
+            )| {
                 (
+                    *tactical_priority,
                     *contested_head,
                     *cramped,
                     *hazard,

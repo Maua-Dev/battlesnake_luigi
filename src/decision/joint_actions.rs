@@ -55,6 +55,24 @@ impl JointActionGenerator {
         }
     }
 
+    pub(crate) fn adversarial_root(
+        state: &SimulatedGameState,
+        our_moves: MoveMask,
+        mobility: &MobilityAnalysis,
+    ) -> Self {
+        let mut generator = Self::new(state, our_moves, mobility);
+        if let Some(ours) = state.actor_index(&state.our_snake_id) {
+            for (actor, options) in &mut generator.options {
+                if *actor != ours {
+                    // The rules accept losing directions as inputs; do not
+                    // omit them while certifying guaranteed survival.
+                    *options = Direction::ALL.to_vec();
+                }
+            }
+        }
+        generator
+    }
+
     fn advance(&mut self) {
         for index in (0..self.indices.len()).rev() {
             self.indices[index] += 1;

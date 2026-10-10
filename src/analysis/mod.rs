@@ -1,4 +1,6 @@
 mod adversarial_escape;
+mod immediate_tactics;
+pub(crate) use immediate_tactics::RootTactics;
 mod escape_evidence;
 #[cfg(test)]
 pub(crate) mod replay_fixtures;
