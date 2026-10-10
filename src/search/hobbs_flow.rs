@@ -54,15 +54,28 @@ struct RouteRank {
 }
 
 impl RouteRank {
+    // Only terminal outcomes and proven traps may override Hobbs' strategic
+    // score. Unproven corridor risk belongs strictly in the tiebreakers:
+    // otherwise a nominally Viable 20% territory route beats a Constrained
+    // 70% route even when the alleged trap was never demonstrated.
     fn tier(self) -> u8 {
         match (self.score, self.safety) {
-            (StateScore::Win, _) => 6,
-            (StateScore::Loss, _) | (_, TrapAssessment::ProvenTrap) => 0,
-            (StateScore::Tie, _) => 1,
-            (_, TrapAssessment::Viable) => 5,
-            (_, TrapAssessment::Unknown) => 4,
-            (_, TrapAssessment::Constrained) => 3,
-            (_, TrapAssessment::ForcedCorridor) => 2,
+            (StateScore::Win, _) => 4,
+            (StateScore::Loss, _) => 0,
+            (_, TrapAssessment::ProvenTrap) => 1,
+            (StateScore::Tie, _) => 2,
+            _ => 3,
+        }
+    }
+
+    // Bounded risk premium (milli-points). A credible edge/corridor threat
+    // matters when Hobbs scores are close, without categorically vetoing a
+    // substantially stronger territory position.
+    fn risk_penalty_milli(self) -> i64 {
+        match self.safety {
+            TrapAssessment::Constrained => 180,
+            TrapAssessment::ForcedCorridor => 280,
+            TrapAssessment::Viable | TrapAssessment::Unknown | TrapAssessment::ProvenTrap => 0,
         }
     }
 
@@ -81,6 +94,9 @@ impl Ord for RouteRank {
     fn cmp(&self, other: &Self) -> Ordering {
         self.tier()
             .cmp(&other.tier())
+            // Preserve Hobbs' health mode and territorial value. A small,
+            // bounded penalty prevents edge-pin regressions when the territory
+            // gap is marginal; no unproven warning is a hard veto.
             .then_with(|| match (self.score, other.score) {
                 (
                     StateScore::Normal {
@@ -90,12 +106,12 @@ impl Ord for RouteRank {
                         utility_milli: right,
                     },
                 ) => left
-                    .saturating_add(i64::from(self.pressure) * 20)
-                    .cmp(&right.saturating_add(i64::from(other.pressure) * 20)),
+                    .saturating_sub(self.risk_penalty_milli())
+                    .cmp(&right.saturating_sub(other.risk_penalty_milli())),
                 _ => self.score.cmp(&other.score),
             })
-            .then_with(|| self.pressure.cmp(&other.pressure))
             .then_with(|| self.safety_rank().cmp(&other.safety_rank()))
+            .then_with(|| self.pressure.cmp(&other.pressure))
     }
 }
 
@@ -159,6 +175,12 @@ struct ScoredCache {
     /// Replaced atomically after a successful depth (never on deadline).
     completed_root_lines: HashMap<Direction, CompletedRootLine>,
     v2_spent: Duration,
+    // Only completed depths can supply BestFirst hints. Work from an
+    // interrupted depth is never promoted to the next search iteration.
+    bestfirst_completed: HashMap<Direction, RouteRank>,
+    bestfirst_candidate: HashMap<Direction, RouteRank>,
+    // Bound territorial root sampling across ALL deepening iterations.
+    primary_spent: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -341,6 +363,35 @@ fn conservative_v2_root_order(
     );
 }
 
+/// Mimics Hobbs' previous-iteration BestFirst search at the root without
+/// allocating a second evaluation tree. Unknown/pruned directions are
+/// explored after completed-score directions, with deterministic ties.
+fn bestfirst_root_order(
+    directions: &mut [Direction],
+    preferred: Option<Direction>,
+    completed: &HashMap<Direction, RouteRank>,
+) {
+    directions.sort_by(|left, right| {
+        match (completed.get(left), completed.get(right)) {
+            (Some(a), Some(b)) => b.cmp(a),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        }
+        .then_with(|| (Some(*left) != preferred).cmp(&(Some(*right) != preferred)))
+        .then_with(|| left.rank().cmp(&right.rank()))
+    });
+}
+
+/// Total extra territory-sampling time across iterative deepening. The
+/// limit prevents ordering hints from displacing the next completed ply.
+const PRIMARY_SAMPLING_TOTAL: Duration = Duration::from_millis(6);
+const PRIMARY_SAMPLING_PER_DEPTH: Duration = Duration::from_millis(2);
+
+fn primary_sampling_allowance(spent: Duration) -> Duration {
+    PRIMARY_SAMPLING_PER_DEPTH.min(PRIMARY_SAMPLING_TOTAL.saturating_sub(spent))
+}
+
 fn alpha_cuts_reply(incumbent: &Route, worst_so_far: &Route) -> bool {
     // MIN cannot improve its value by inspecting additional replies. Once its
     // upper bound is <= this MAX incumbent, the action cannot win the MAX.
@@ -353,6 +404,7 @@ enum RootSearchOrdering {
     Primary,
     PrimaryV3,
     ConservativeV2,
+    BestFirst,
 }
 
 /// Primary Hobbs search: the territory-first root ordering that won 3/3
@@ -382,6 +434,16 @@ pub(crate) fn search_hobbs_ordering_v3(
     search_hobbs_with_ordering(graph, budget, RootSearchOrdering::PrimaryV3)
 }
 
+/// Experimental no-extra-sampling root order matching Hobbs' previous-depth
+/// BestFirst preference. Keeps the same safety policy and FutureGraph as the
+/// production engine; this is an ordering reference, not an exact Hobbs port.
+pub(crate) fn search_hobbs_bestfirst(
+    graph: &mut FutureGraph,
+    budget: &SearchBudget,
+) -> Result<Option<HobbsSearchResult>, SearchError> {
+    search_hobbs_with_ordering(graph, budget, RootSearchOrdering::BestFirst)
+}
+
 /// Only opt-in ordering_v2 changes root exploration order. All MIN responses
 /// and the original RouteRank / compare_routes semantics are retained.
 pub(crate) fn search_hobbs_ordering_v2(
@@ -405,6 +467,7 @@ fn search_hobbs_with_ordering(
         if search_budget.expired() {
             break;
         }
+        scored.bestfirst_candidate.clear();
         let Some(route) = evaluate_minimax(
             graph,
             root,
@@ -451,6 +514,9 @@ fn search_hobbs_with_ordering(
             directions.len(),
             graph.node_count(),
         );
+        if ordering_mode == RootSearchOrdering::BestFirst {
+            scored.bestfirst_completed = std::mem::take(&mut scored.bestfirst_candidate);
+        }
         last_complete = Some(HobbsSearchResult {
             direction,
             score: route.rank.score,
@@ -585,97 +651,104 @@ fn evaluate_minimax(
     let mut directions = graph.available_directions(node_id);
     let preferred = graph.node(node_id).preferred_direction;
     if node_id == graph.root() {
-        // Tactical move ordering only. A one-ply corridor estimate cannot
-        // prove a forced trap: all legal joint-action replies remain in MIN.
-        let mut corridor_by_direction = HashMap::<Direction, (u8, u8)>::new();
-        for direction in &directions {
-            let known = graph.known_responses(node_id, *direction);
-            if known.is_empty() {
-                continue;
-            }
-            let mut worst_ours = u8::MAX;
-            let mut best_enemy = 0_u8;
-            for edge in known {
-                let forecast = cache.corridor(graph, edge.child);
-                worst_ours = worst_ours.min(forecast.our_continuations());
-                best_enemy = best_enemy.max(forecast.enemy_continuations());
-            }
-            corridor_by_direction.insert(*direction, (worst_ours, best_enemy));
-        }
-        // Stable 3fcb6a1 tactical priority is the fallback when the primary
-        // ordering lacks samples for one or more root directions.
-        baseline_root_order(&mut directions, preferred, &corridor_by_direction);
-        // Primary: sample at most 24 unique cached states per search,
-        // considering up to two MIN replies and four cached positions.
-        // Each eligible search depth has a 2ms sampling deadline.
-        // No new graph actions are generated by these territory samples.
-        let mut territorial = HashMap::<Direction, TerritoryDirectionSample>::new();
-        if matches!(
-            ordering_mode,
-            RootSearchOrdering::Primary | RootSearchOrdering::PrimaryV3
-        ) && depth >= 2
-            && !budget.expired()
-        {
-            let expires = Instant::now() + Duration::from_millis(2);
+        if ordering_mode == RootSearchOrdering::BestFirst {
+            bestfirst_root_order(&mut directions, preferred, &cache.bestfirst_completed);
+        } else {
+            // Tactical move ordering only. A one-ply corridor estimate cannot
+            // prove a forced trap: all legal joint-action replies remain in MIN.
+            let mut corridor_by_direction = HashMap::<Direction, (u8, u8)>::new();
             for direction in &directions {
-                if Instant::now() >= expires {
-                    break;
+                let known = graph.known_responses(node_id, *direction);
+                if known.is_empty() {
+                    continue;
                 }
-                if let Some(sample) = TerritoryDirectionSample::from_cached_replies(
-                    graph,
-                    *direction,
-                    &mut cache.territory_snapshots,
-                    |id| cache.leaf_ranks.get(&id).and_then(|leaf| leaf.territory),
-                    ordering_mode == RootSearchOrdering::PrimaryV3,
-                    expires,
-                ) {
-                    territorial.insert(*direction, sample);
+                let mut worst_ours = u8::MAX;
+                let mut best_enemy = 0_u8;
+                for edge in known {
+                    let forecast = cache.corridor(graph, edge.child);
+                    worst_ours = worst_ours.min(forecast.our_continuations());
+                    best_enemy = best_enemy.max(forecast.enemy_continuations());
                 }
+                corridor_by_direction.insert(*direction, (worst_ours, best_enemy));
             }
-        }
-        // V3 compares against the exact primary order without another
-        // search, flood-fill, or MIN expansion (at most four root moves).
-        let primary_reference = (ordering_mode == RootSearchOrdering::PrimaryV3).then(|| {
-            let mut reference = directions.clone();
+            // Stable 3fcb6a1 tactical priority is the fallback when the primary
+            // ordering lacks samples for one or more root directions.
+            baseline_root_order(&mut directions, preferred, &corridor_by_direction);
+            // Primary: sample at most 24 unique cached states per search,
+            // considering up to two MIN replies and four cached positions.
+            // Maximum 2ms per depth, and 6ms across this entire request.
+            // No new graph actions are generated by these territory samples.
+            let mut territorial = HashMap::<Direction, TerritoryDirectionSample>::new();
+            if matches!(
+                ordering_mode,
+                RootSearchOrdering::Primary | RootSearchOrdering::PrimaryV3
+            ) && depth >= 2
+                && !budget.expired()
+                && !primary_sampling_allowance(cache.primary_spent).is_zero()
+            {
+                let sample_started = Instant::now();
+                let expires = sample_started + primary_sampling_allowance(cache.primary_spent);
+                for direction in &directions {
+                    if Instant::now() >= expires {
+                        break;
+                    }
+                    if let Some(sample) = TerritoryDirectionSample::from_cached_replies(
+                        graph,
+                        *direction,
+                        &mut cache.territory_snapshots,
+                        |id| cache.leaf_ranks.get(&id).and_then(|leaf| leaf.territory),
+                        ordering_mode == RootSearchOrdering::PrimaryV3,
+                        expires,
+                    ) {
+                        territorial.insert(*direction, sample);
+                    }
+                }
+                cache.primary_spent = cache.primary_spent.saturating_add(sample_started.elapsed());
+            }
+            // V3 compares against the exact primary order without another
+            // search, flood-fill, or MIN expansion (at most four root moves).
+            let primary_reference = (ordering_mode == RootSearchOrdering::PrimaryV3).then(|| {
+                let mut reference = directions.clone();
+                sort_primary_root(
+                    &mut reference,
+                    preferred,
+                    &corridor_by_direction,
+                    &territorial,
+                    false,
+                );
+                reference
+            });
             sort_primary_root(
-                &mut reference,
+                &mut directions,
                 preferred,
                 &corridor_by_direction,
                 &territorial,
-                false,
+                ordering_mode == RootSearchOrdering::PrimaryV3,
             );
-            reference
-        });
-        sort_primary_root(
-            &mut directions,
-            preferred,
-            &corridor_by_direction,
-            &territorial,
-            ordering_mode == RootSearchOrdering::PrimaryV3,
-        );
-        if let Some(reference) = primary_reference {
-            let significant_drops = territorial
-                .values()
-                .filter(|sample| {
-                    sample
-                        .territorial_drop
-                        .is_some_and(|drop| drop.significant())
-                })
-                .count();
-            log::debug!(
-                target: "territorial_control",
-                "root_ordering_v3 turn={} depth={} changed={} sampled={} sharp_drops={} primary={:?} actual={:?}",
-                graph.node(node_id).state.turn,
-                depth,
-                directions != reference,
-                territorial.len(),
-                significant_drops,
-                reference,
-                directions,
-            );
-        }
-        if ordering_mode == RootSearchOrdering::ConservativeV2 {
-            conservative_v2_root_order(graph, &mut directions, depth, cache, budget);
+            if let Some(reference) = primary_reference {
+                let significant_drops = territorial
+                    .values()
+                    .filter(|sample| {
+                        sample
+                            .territorial_drop
+                            .is_some_and(|drop| drop.significant())
+                    })
+                    .count();
+                log::debug!(
+                    target: "territorial_control",
+                    "root_ordering_v3 turn={} depth={} changed={} sampled={} sharp_drops={} primary={:?} actual={:?}",
+                    graph.node(node_id).state.turn,
+                    depth,
+                    directions != reference,
+                    territorial.len(),
+                    significant_drops,
+                    reference,
+                    directions,
+                );
+            }
+            if ordering_mode == RootSearchOrdering::ConservativeV2 {
+                conservative_v2_root_order(graph, &mut directions, depth, cache, budget);
+            }
         }
     } else {
         directions.sort_by_key(|direction| (Some(*direction) != preferred, direction.rank()));
@@ -704,14 +777,15 @@ fn evaluate_minimax(
         let mut known = graph.known_responses(node_id, direction);
         let known_count = known.len();
         let preferred_response = graph.node(node_id).preferred_reply.get(&direction).cloned();
-        let corridor_hints = if node_id == graph.root() {
-            known
-                .iter()
-                .map(|edge| (edge.child, cache.corridor(graph, edge.child)))
-                .collect::<HashMap<NodeId, AdversarialCorridorOrder>>()
-        } else {
-            HashMap::new()
-        };
+        let corridor_hints =
+            if node_id == graph.root() && ordering_mode != RootSearchOrdering::BestFirst {
+                known
+                    .iter()
+                    .map(|edge| (edge.child, cache.corridor(graph, edge.child)))
+                    .collect::<HashMap<NodeId, AdversarialCorridorOrder>>()
+            } else {
+                HashMap::new()
+            };
         known.sort_by(|a, b| {
             (preferred_response.as_ref() == Some(&b.joint_action))
                 .cmp(&(preferred_response.as_ref() == Some(&a.joint_action)))
@@ -743,7 +817,7 @@ fn evaluate_minimax(
                         new_edge
                     }
                     ResponseLookup::Exhausted => break,
-                    ResponseLookup::Deadline => return Ok(None),
+                    ResponseLookup::Deadline | ResponseLookup::ResourceLimit => return Ok(None),
                 }
             };
             if budget.expired() {
@@ -812,6 +886,11 @@ fn evaluate_minimax(
             }
             if pruned {
                 continue;
+            }
+            if is_root && ordering_mode == RootSearchOrdering::BestFirst {
+                cache
+                    .bestfirst_candidate
+                    .insert(direction, worst_response.rank);
             }
             if best.as_ref().is_none_or(|previous| {
                 compare_routes(&worst_response, previous).is_gt()
@@ -1200,6 +1279,52 @@ mod tests {
     }
 
     #[test]
+    fn proven_trap_is_worse_than_a_territorially_weak_escape() {
+        let trapped = RouteRank {
+            score: StateScore::Normal {
+                utility_milli: 1000,
+            },
+            safety: TrapAssessment::ProvenTrap,
+            pressure: 0,
+        };
+        let escape = RouteRank {
+            score: StateScore::Normal {
+                utility_milli: -1000,
+            },
+            safety: TrapAssessment::Constrained,
+            pressure: 0,
+        };
+        assert!(escape > trapped);
+        assert!(
+            RouteRank {
+                score: StateScore::Win,
+                safety: TrapAssessment::Unknown,
+                pressure: 0,
+            } > trapped
+        );
+    }
+
+    #[test]
+    fn soft_safety_is_bounded_and_cannot_veto_large_territory_advantage() {
+        let unconstrained = RouteRank {
+            score: StateScore::Normal { utility_milli: 500 },
+            safety: TrapAssessment::Viable,
+            pressure: 0,
+        };
+        let constrained = RouteRank {
+            safety: TrapAssessment::Constrained,
+            ..unconstrained
+        };
+        assert!(unconstrained > constrained);
+        assert!(
+            RouteRank {
+                score: StateScore::Normal { utility_milli: 900 },
+                ..constrained
+            } > unconstrained
+        );
+    }
+
+    #[test]
     fn loss_tie_prefers_less_restricted_escape() {
         let less_restricted = RouteRank {
             score: StateScore::Loss,
@@ -1244,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn constrained_exit_loses_to_viable_alternative_without_score_weight() {
+    fn higher_hobbs_territory_beats_unproven_corridor_risk() {
         let constrained = RouteRank {
             score: StateScore::Normal {
                 utility_milli: 1000,
@@ -1259,7 +1384,7 @@ mod tests {
             safety: TrapAssessment::Viable,
             pressure: 0,
         };
-        assert!(viable > constrained);
+        assert!(constrained > viable);
         assert!(
             constrained
                 > RouteRank {
@@ -1294,18 +1419,85 @@ mod tests {
             safety: TrapAssessment::ForcedCorridor,
             pressure: 2,
         };
-        assert!(threatening > safe);
+        assert!(safe > threatening);
         assert!(
             safe > reckless,
-            "small corridor hints cannot override strong territory"
+            "corridor pressure cannot override Hobbs territory"
         );
-        assert!(safe > unsafe_attack);
+        assert!(
+            unsafe_attack > safe,
+            "unproven corridor risk is not a hard veto"
+        );
         assert!(
             RouteRank {
                 score: StateScore::Win,
                 safety: TrapAssessment::Unknown,
                 pressure: 0,
             } > threatening
+        );
+    }
+
+    #[test]
+    fn bestfirst_prioritizes_only_completed_previous_depth_scores() {
+        let ranks = HashMap::from([
+            (
+                Direction::Left,
+                RouteRank {
+                    score: StateScore::Normal { utility_milli: 800 },
+                    safety: TrapAssessment::Viable,
+                    pressure: 0,
+                },
+            ),
+            (
+                Direction::Up,
+                RouteRank {
+                    score: StateScore::Normal { utility_milli: 300 },
+                    safety: TrapAssessment::Viable,
+                    pressure: 0,
+                },
+            ),
+        ]);
+        let mut directions = Direction::ALL.to_vec();
+        bestfirst_root_order(&mut directions, Some(Direction::Right), &ranks);
+        assert_eq!(
+            directions,
+            vec![
+                Direction::Left,
+                Direction::Up,
+                Direction::Right,
+                Direction::Down,
+            ]
+        );
+        let mut empty = Direction::ALL.to_vec();
+        bestfirst_root_order(&mut empty, Some(Direction::Right), &HashMap::new());
+        assert_eq!(
+            empty,
+            vec![
+                Direction::Right,
+                Direction::Up,
+                Direction::Down,
+                Direction::Left,
+            ]
+        );
+    }
+
+    #[test]
+    fn territorial_sampling_budget_is_request_bounded() {
+        assert_eq!(
+            primary_sampling_allowance(Duration::ZERO),
+            Duration::from_millis(2)
+        );
+        assert_eq!(
+            primary_sampling_allowance(Duration::from_millis(5)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            primary_sampling_allowance(Duration::from_millis(6)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            primary_sampling_allowance(Duration::from_millis(8)),
+            Duration::ZERO
         );
     }
 
@@ -1424,7 +1616,7 @@ mod tests {
             let edge = match graph.next_response(root, direction, next_index, budget)? {
                 ResponseLookup::Edge(edge) => edge,
                 ResponseLookup::Exhausted => break,
-                ResponseLookup::Deadline => return Ok(None),
+                ResponseLookup::Deadline | ResponseLookup::ResourceLimit => return Ok(None),
             };
             next_index += 1;
             let Some(mut candidate) = evaluate_minimax(

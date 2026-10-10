@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::direction::Direction;
 use crate::navigation::NavigationMap;
+use crate::simulation::mobility::MobilityAnalysis;
+use crate::simulation::state::SimulatedGameState;
 use crate::GameState;
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,43 +65,50 @@ pub(crate) fn direction_stays_in_bounds(state: &GameState, direction: Direction)
         && target.y < state.board.height as i32
 }
 
+/// Bounded, deterministic emergency policy. This intentionally does not
+/// invoke FutureGraph, adversarial search or extra flood fills: it must still
+/// return on a CPU-starved 256 MB Lambda worker.
+///
+/// Use the same deterministic collision/health checks as the main search,
+/// exclude contested equal-or-larger head moves when an alternative exists,
+/// and prefer reachable territory while healthy. The Hobbs food policy only
+/// takes priority below the duel/crowded critical-health thresholds.
 pub(crate) fn choose_move_baseline(state: &GameState) -> Decision {
-    let simulated = crate::simulation::state::SimulatedGameState::from(state);
-    let tactics = crate::analysis::RootTactics::when_head_contact_possible(
-        &simulated,
-        std::time::Instant::now() + std::time::Duration::from_millis(12),
-        16,
-    );
-    choose_move_baseline_with_tactics(state, tactics.as_ref())
+    choose_move_baseline_with_tactics(state, None)
 }
 
+/// Uses the exact same fallback scoring as native SnakeBollada, but preserves
+/// Maua's certified one-ply tactical safety override when available.
 pub(crate) fn choose_move_baseline_with_tactics(
     state: &GameState,
     tactics: Option<&crate::analysis::RootTactics>,
 ) -> Decision {
-    // The time-budget fallback must avoid a provable body collision BEFORE
-    // ranking food. It is used whenever the Lambda cannot finish MAX/MIN.
-    let simulated = crate::simulation::state::SimulatedGameState::from(state);
-    let mobility = crate::simulation::mobility::MobilityAnalysis::from_state(&simulated);
-    let deterministic = simulated
-        .snake(&simulated.our_snake_id)
-        .map(|ours| {
-            Direction::ALL
-                .into_iter()
-                .filter(|direction| {
-                    mobility
-                        .classify_move(&simulated, ours, *direction)
-                        .is_none()
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if deterministic.is_empty() {
+    let map = NavigationMap::from_state(state);
+    let simulated = SimulatedGameState::from(state);
+    let mobility = MobilityAnalysis::from_state(&simulated);
+    let legal_moves = mobility
+        .deterministic_moves_for(&simulated, &simulated.our_snake_id)
+        .iter()
+        .collect::<Vec<_>>();
+
+    if legal_moves.is_empty() {
+        // No move survives deterministic rules; avoid emitting a wall move.
         let direction = Direction::ALL
             .into_iter()
             .filter(|direction| direction_stays_in_bounds(state, *direction))
-            .min_by_key(|direction| direction.rank())
+            .min_by_key(|direction| {
+                let destination = direction.apply(state.you.head);
+                let food_distance = state
+                    .board
+                    .food
+                    .iter()
+                    .map(|food| destination.x.abs_diff(food.x) + destination.y.abs_diff(food.y))
+                    .min()
+                    .unwrap_or(u32::MAX);
+                (food_distance, direction.rank())
+            })
             .unwrap_or(Direction::Up);
+
         return Decision {
             direction,
             reason: DecisionReason::NoSafeMove,
@@ -108,20 +117,62 @@ pub(crate) fn choose_move_baseline_with_tactics(
         };
     }
 
-    let map = NavigationMap::from_state(state);
-    let best = deterministic
+    if legal_moves.len() == 1 {
+        let direction = legal_moves[0];
+        return Decision {
+            direction,
+            reason: DecisionReason::OnlyLegalMove,
+            reachable_cells: mobility.reachable_space(
+                &simulated,
+                &simulated.our_snake_id,
+                direction,
+            ),
+            search: SearchMetadata::default(),
+        };
+    }
+
+    // Head-to-head exposure is not certain death: allow these directions
+    // when every deterministic legal move is contested.
+    let uncontested = legal_moves
+        .iter()
+        .copied()
+        .filter(|direction| {
+            !map.lethal_head_danger
+                .contains(direction.apply(state.you.head))
+        })
+        .collect::<Vec<_>>();
+    // A fully verified one-ply safe move takes precedence over paths with
+    // demonstrated immediate counterexamples. Incomplete evidence never
+    // becomes a safety certificate; retain the territorial baseline then.
+    let verified = tactics
+        .filter(|report| report.any_verified_safe())
+        .map(|report| {
+            legal_moves
+                .iter()
+                .copied()
+                .filter(|direction| report.verified_safe(*direction))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let candidates = if !verified.is_empty() {
+        &verified
+    } else if !uncontested.is_empty() {
+        &uncontested
+    } else {
+        &legal_moves
+    };
+    let living_snakes = simulated.snakes.iter().filter(|snake| snake.alive).count();
+    let critical_health = if living_snakes >= 3 { 85 } else { 60 };
+    let needs_food = state.you.health < critical_health;
+
+    let (direction, reachable) = candidates
         .iter()
         .copied()
         .map(|direction| {
             let destination = direction.apply(state.you.head);
             let reachable =
                 mobility.reachable_space(&simulated, &simulated.our_snake_id, direction);
-            let safe = tactics.is_some_and(|report| report.verified_safe(direction));
-            let tactical_priority =
-                tactics.is_some_and(|report| report.any_verified_safe() && !safe);
-            let contested_head = !safe && map.lethal_head_danger.contains(destination);
             let cramped = reachable < state.you.length;
-            let hazard = map.is_hazard(destination);
             let food_distance = state
                 .board
                 .food
@@ -132,43 +183,28 @@ pub(crate) fn choose_move_baseline_with_tactics(
             (
                 direction,
                 reachable,
-                tactical_priority,
-                contested_head,
                 cramped,
-                hazard,
+                map.is_hazard(destination),
                 food_distance,
             )
         })
-        .min_by_key(
-            |(
-                direction,
-                reachable,
-                tactical_priority,
-                contested_head,
-                cramped,
-                hazard,
-                food_distance,
-            )| {
-                (
-                    *tactical_priority,
-                    *contested_head,
-                    *cramped,
-                    *hazard,
-                    std::cmp::Reverse(*reachable),
-                    *food_distance,
-                    direction.rank(),
-                )
-            },
-        )
-        .expect("at least one deterministic move");
+        .min_by_key(|(direction, reachable, cramped, hazard, food_distance)| {
+            (
+                *cramped,
+                if needs_food { *food_distance } else { 0 },
+                *hazard,
+                std::cmp::Reverse(*reachable),
+                *food_distance,
+                direction.rank(),
+            )
+        })
+        .map(|(direction, reachable, _, _, _)| (direction, reachable))
+        .expect("one or more deterministic legal moves");
+
     Decision {
-        direction: best.0,
-        reason: if deterministic.len() == 1 {
-            DecisionReason::OnlyLegalMove
-        } else {
-            DecisionReason::BaselineFallback
-        },
-        reachable_cells: best.1,
+        direction,
+        reason: DecisionReason::BaselineFallback,
+        reachable_cells: reachable,
         search: SearchMetadata::default(),
     }
 }
@@ -851,6 +887,49 @@ mod tests {
 
         assert_eq!(decision.reason, DecisionReason::BaselineFallback);
         assert!(decision.reachable_cells > 0);
+    }
+
+    #[test]
+    fn fallback_avoids_losing_head_to_head_with_legal_alternatives() {
+        let ours = snake(
+            "ours",
+            vec![
+                Coord { x: 2, y: 2 },
+                Coord { x: 2, y: 1 },
+                Coord { x: 2, y: 0 },
+            ],
+        );
+        let enemy = snake(
+            "enemy",
+            vec![
+                Coord { x: 4, y: 2 },
+                Coord { x: 4, y: 1 },
+                Coord { x: 4, y: 0 },
+                Coord { x: 5, y: 0 },
+            ],
+        );
+        let board = state(ours, vec![enemy], vec![Coord { x: 3, y: 2 }]);
+        let chosen = choose_move_baseline(&board);
+        assert_ne!(chosen.direction, Direction::Right);
+        assert_eq!(chosen.reason, DecisionReason::BaselineFallback);
+    }
+
+    #[test]
+    fn fallback_survives_when_only_a_vacating_tail_is_available() {
+        let ours = snake(
+            "ours",
+            vec![
+                Coord { x: 0, y: 0 },
+                Coord { x: 0, y: 1 },
+                Coord { x: 1, y: 1 },
+                Coord { x: 1, y: 0 },
+            ],
+        );
+        let board = state(ours, vec![], vec![]);
+        let chosen = choose_move_baseline(&board);
+        assert_eq!(chosen.direction, Direction::Right);
+        assert_eq!(chosen.reason, DecisionReason::OnlyLegalMove);
+        assert!(chosen.reachable_cells > 0);
     }
 
     #[test]

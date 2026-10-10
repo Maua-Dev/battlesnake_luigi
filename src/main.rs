@@ -23,7 +23,9 @@ mod simulation;
 mod spatial;
 mod strategy;
 mod v3_models;
-pub(crate) use v3_models::{Battlesnake, Board, Coord, Game, GameState};
+pub(crate) use v3_models::{Battlesnake, Coord, GameState};
+#[cfg(test)]
+pub(crate) use v3_models::{Board, Game};
 
 use lambda_http::{run, service_fn, Body, Error, Request, RequestPayloadExt, Response};
 use models::GameState as RequestGameState;
